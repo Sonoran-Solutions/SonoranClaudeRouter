@@ -63,16 +63,42 @@ call. Its wrapper is covered by the fake-worker suite only.
 
 ## Observations and caveats
 
-- One earlier Pi run (same task) produced only the start record and then hit the 200 s timeout; pi had emitted no
-  record at all (not even its first `session` line, which normally appears at ~0.5 s). It did not reproduce in
-  four later runs. Root cause unknown; not attributed to the wrappers, but not proven otherwise.
-- That timed-out Pi run was recorded as `exit_code: 1`, not 124. This is the **existing** `run_pi.sh` behaviour:
-  its failure branch runs `printf | grep -i error | tail | cut` under `set -euo pipefail`, and when no line
-  matches `error` the script exits 1 before `exit $rc`. The instrumented wrapper preserves it (the log reports what
-  the wrapper returns). Fixing it is a separate router change.
+- **Pi startup stall (not caused by the wrappers).** Two wrapped Pi runs produced no record at all, not even pi's
+  first `session` line, and ran into the timeout. A controlled A/B run on 2026-10-19 (6 direct `pi -p` runs
+  without any wrapper, stderr captured, plus 6 wrapped runs, all started together, `ORCH_TIMEOUT=90`) stalled
+  **12 of 12, direct runs included**, with empty stderr. A single direct run right afterwards printed nothing for
+  over 6 s while holding one established HTTPS connection to a Cloudflare address (OpenRouter's CDN), then
+  completed. Working hypothesis, unproven: pi fetches remote model metadata at startup for an id outside its
+  static list (it warns `Model "deepseek/deepseek-v4.1-flash-1017" not found for provider "openrouter"`), and that
+  request can hang without a timeout. Tracked as a separate investigation; no wrapper change is proposed for it.
+- **Fixed: Pi timeout status.** The original `run_pi.sh` failure branch ran `printf | grep -i error | tail | cut`
+  under `set -euo pipefail`; with no `error` line, grep's status 1 ended the script before `exit $rc`, so a silent
+  timeout returned 1 instead of 124. The pipeline now uses `{ grep -i error || true; }`. A test with a fake pi that
+  prints nothing proves 124 with logging on and off; a live stalled run above was recorded as `exit_code 124`,
+  `timed_out true`. `run_codex.sh` and `run_agy.sh` failure branches do not have this problem.
+
+## Revision after senior review (2026-10-19)
+
+| Finding | Change | Proof |
+| --- | --- | --- |
+| P1 spawn could be forwarded twice | `agent.spawn` hook calls `next(e)` once, bookkeeping in try/catch, **no `.catch`** (per the 2.1.299 types, a hook that fails after `next` was answered "is skipped by name and its last `next` stands") | `tests/spawn.test.ts`: normal, rejecting, denied and failing-bookkeeping paths each forward exactly once |
+| P1 logs over 4 MiB lose the exit status | Contract now separates a tiny lifecycle file (`<run-id>.jsonl`: start/final/exit) from rotating event segments (`<run-id>.<n>.jsonl`, 1 MiB each, newest 4 kept, oversize lines replaced by a placeholder); the mod reads the lifecycle file every change and segments independently, with a per-file read limit | wrapper tests: Codex and Pi runs printing >4 MiB then exiting 3 keep a <8 KiB lifecycle file with `exit_code 3`, ≤3 segments each ≤2× segment size; mod tests: exit after partly rotated >4 MiB segments shows `exited 3` with omitted counts, and an oversized live segment doesn't block the exit |
+| P2 one unreadable log blocks all runs | per-run and per-file error isolation; warning on the affected run, retried next poll | mod test: EACCES on run A, run B still reaches `exited 0` in the same poll |
+| P2 Pi silent timeout masked | see "Fixed: Pi timeout status" above | wrapper test with a silent fake pi |
+| P2 no rollback path | `orchestrator/README.md`: diff, dated backup, install, check, rollback commands | doc review |
+
+Checks after the revision: `bash tests/wrappers.test.sh` → 0 checks failed (180+ checks); `claude plugin test` → 27
+pass; `claude plugin validate` → passed (no author field warning only); tsc clean. Live: a real Codex run through the
+revised wrapper wrote a 527-byte lifecycle file (`exit_code 0`, `segments 1`) and its events to `.1.jsonl`, all
+`0600`.
+
+**Concurrent attribution (phase 2 gate), file level:** while a Claude Opus agent was revising the mod, a Pi worker
+(`revise wrappers…`, 595 records) and a Codex worker (`concurrency gate (codex)`) ran through the instrumented
+wrappers at the same time; each wrote its own run files with its own label and exit. Whether the pane displayed
+them correctly side by side has not yet been confirmed by a person.
 
 ## Live gate, phase 0: native pane in the desktop app
 
-Not yet observed by a person at the time of writing. To check: enable the mod (see
+The owner ran `/agent-inspector` in the desktop app with the mod hot-loaded; the command answered "Agent Inspector opened (read-only)." That the pane **updates and closes cleanly** has not yet been reported by a person. To check: enable the mod (see
 [`mod/agent-inspector/README.md`](../mod/agent-inspector/README.md)), run `/agent-inspector`, launch a wrapper run,
 and confirm the run appears, updates while running, and the pane closes cleanly.

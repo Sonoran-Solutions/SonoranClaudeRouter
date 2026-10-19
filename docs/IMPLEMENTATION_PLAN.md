@@ -9,7 +9,7 @@ Copy the installed Claude Code 2.1.299 `plugin-authoring/pane.tsx` example. Use 
 
 **Gate:** pane opens, updates, and closes cleanly in the desktop app. Record a screenshot and installed version; no fallback frontend.
 
-**Done:** [`mod/agent-inspector/`](../mod/agent-inspector/) (validate + 18 plugin tests on 2.1.299). **Open:** in-app observation by a person.
+**Done:** [`mod/agent-inspector/`](../mod/agent-inspector/) (validate + 18 plugin tests on 2.1.299). **Partly met:** the owner opened it in the desktop app (`/agent-inspector` → opened). **Open:** person confirms it updates and closes cleanly.
 
 ## 1. External runners first
 
@@ -25,7 +25,7 @@ Pane polls files with `$.fs` / `$.clock.every`, renders complete records, tolera
 
 **Gate:** Codex and Pi each show a real event *before exit*; agy is accurately marked final-only. Verify same final result and exit code with monitoring on/off, including when log writing fails.
 
-**Done:** [`orchestrator/`](../orchestrator/) + [`tests/wrappers.test.sh`](../tests/wrappers.test.sh); live Codex and Pi records observed seconds before exit; on/off identical. **Open:** agy live run; installing into the live skill.
+**Done:** [`orchestrator/`](../orchestrator/) + [`tests/wrappers.test.sh`](../tests/wrappers.test.sh); live Codex and Pi records observed seconds before exit; on/off identical. **Open:** agy live run (or accept as a documented limitation); installing into the live skill. Log layout is now a lifecycle file plus rotating segments (senior review P1).
 
 ## 2. Claude attribution
 
@@ -33,7 +33,7 @@ Show Claude-native agent IDs/models and parent/task relationships through `agent
 
 **Gate:** concurrent Claude/Codex/Pi work remains correctly separated.
 
-**Done in code:** observe-only `agent.spawn` + `$.agent.list()` in their own pane group (2.1.299's list exposes no model; spawn does). **Open:** live concurrent check. Quota display deferred.
+**Done in code:** observe-only `agent.spawn` + `$.agent.list()` in their own pane group (2.1.299's list exposes no model; spawn does). Concurrent Claude/Codex/Pi runs write separate, correctly labelled run files (see evidence). **Open:** person confirms the pane shows them separated. Quota display deferred.
 
 ## 3. Acceptance
 
