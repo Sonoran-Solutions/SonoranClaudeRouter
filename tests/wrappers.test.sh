@@ -32,10 +32,17 @@ done
 if [[ $provider == codex ]]; then [[ -n $out && -n $json ]]; fi
 if [[ -n ${FAKE_UMASK_FILE:-} ]]; then : > "$FAKE_UMASK_FILE"; fi
 if [[ -n ${FAKE_SLEEP:-} ]]; then
-  [[ $provider != pi ]] || printf '{"type":"error","error":"waiting for timeout"}\n'
+  [[ $provider != pi || -n ${FAKE_SILENT:-} ]] || printf '{"type":"error","error":"waiting for timeout"}\n'
   if [[ -n $print_timeout ]]; then timeout "$print_timeout" sleep "$FAKE_SLEEP"; else sleep "$FAKE_SLEEP"; fi
 fi
-if [[ -n ${FAKE_GARBAGE:-} ]]; then
+if [[ -n ${FAKE_SILENT:-} ]]; then
+  :
+elif [[ -n ${FAKE_NOISY:-} ]]; then
+  # Fast bulk stream: ~1 KiB per line, > 4 MiB total.
+  for ((i=0; i<${FAKE_NOISY}; i++)); do printf '{"type":"test.noise","i":%d,"pad":"%0960d"}\n' "$i" "$i"; done
+elif [[ -n ${FAKE_BIGLINE:-} ]]; then
+  jq -nc --arg pad "$(head -c "$FAKE_BIGLINE" /dev/zero | tr '\0' 'x')" '{type:"test.big", $pad}'
+elif [[ -n ${FAKE_GARBAGE:-} ]]; then
   printf 'not JSON\n'
 else
   case $provider in
@@ -113,7 +120,29 @@ run() {
   stdout=$tmp/stdout-$serial stderr=$tmp/stderr-$serial result=0
   env XDG_RUNTIME_DIR="$runtime" ORCH_RUNLOG="$enabled" FAKE_RC="$code" "$@" \
     bash "$tmp/scripts/run_$executor.sh" "$tmp/prompt.txt" "$tmp/work" > "$stdout" 2> "$stderr" || result=$?
-  log=$(find "$runtime" -name '*.jsonl' -type f -print -quit)
+  # Lifecycle file = <run-id>.jsonl; segments = <run-id>.<n>.jsonl.
+  log=$(find "$runtime" -type f -name '*.jsonl' ! -name '*.*.jsonl' -print -quit)
+  segs=()
+  if [[ -n $log ]]; then
+    base=${log##*/}
+    while IFS= read -r seg; do
+      [[ -n $seg ]] && segs+=("$seg")
+    done < <(find "$runtime" -type f -name "${base%.jsonl}.[0-9]*.jsonl" \
+      | sort -t. -k2 -n)
+  fi
+}
+# Concatenated segment records equal the expected fixture, record for record.
+seg_matches() {
+  local expected=$1 f rc=0
+  shift
+  for f in "$@"; do jq -c . "$f" || return 1; done > "$tmp/seg-concat.jsonl"
+  jq -c . "$expected" > "$tmp/seg-expected.jsonl"
+  cmp -s "$tmp/seg-concat.jsonl" "$tmp/seg-expected.jsonl" || rc=1
+  return "$rc"
+}
+# All lines of a run's segments, in segment order.
+seg_records() {
+  [[ ${#segs[@]} -gt 0 ]] && jq -sc '.' "${segs[@]}" || printf '[]\n'
 }
 records() {
   jq -se --arg executor "$1" --argjson code "$2" --arg workdir "$tmp/work" '
@@ -127,6 +156,7 @@ records() {
     and $s.model == (if $executor == "pi" then "test/resolved" else null end)
     and $s.granularity == (if $executor == "agy" then "final-only" else "live" end)
     and $e.exit_code == $code and $e.timed_out == ($code == 124)
+    and ($e.segments | type == "number" and . >= 0)
     and ($e.duration_ms | type == "number" and . >= 0)
     and ([.[] | select(.type | startswith("orchestrator.")) | .ts
           | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$")] | all)
@@ -154,8 +184,7 @@ done
 
 run codex 1 0
 check 'codex -o result printed' test "$(cat "$stdout")" = done
-check 'codex provider events retained' jq -se --slurpfile expected "$FIXTURES/codex-exec.jsonl" \
-  '[.[] | select(.type | startswith("orchestrator.") | not)] == $expected' "$log"
+check 'codex provider events retained' seg_matches "$FIXTURES/codex-exec.jsonl" "${segs[@]}"
 
 # Run the normal invocation in the background and inspect its file before completion.
 live=$tmp/live
@@ -165,8 +194,9 @@ env XDG_RUNTIME_DIR="$live" ORCH_RUNLOG=1 FAKE_READY="$tmp/ready" FAKE_PAUSE=2 F
 worker=$!
 seen=0
 for ((i=0; i<100; i++)); do
-  live_log=$(find "$live" -name '*.jsonl' -type f -print -quit)
-  if [[ -n $live_log ]] && jq -se 'any(.[]; .type == "session")' "$live_log" >/dev/null 2>&1; then
+  live_log=$(find "$live" -type f -name '*.jsonl' ! -name '*.*.jsonl' -print -quit)
+  live_seg=$(find "$live" -type f -name '*.[0-9]*.jsonl' -print -quit)
+  if [[ -n $live_log && -n $live_seg ]] && jq -se 'any(.[]; .type == "session")' "$live_seg" >/dev/null 2>&1; then
     [[ ! -e $tmp/finished ]] && kill -0 "$worker" 2>/dev/null && seen=1
     break
   fi
@@ -175,12 +205,19 @@ done
 check 'pi provider record appears while worker runs' test "$seen" = 1
 wait "$worker"
 log=$live_log
+live_base=${log##*/}
+segs=()
+while IFS= read -r seg; do [[ -n $seg ]] && segs+=("$seg"); done \
+  < <(find "$live" -type f -name "${live_base%.jsonl}.[0-9]*.jsonl" | sort -t. -k2 -n)
 check 'pi stdout parse unchanged' test "$(cat "$tmp/live.out")" = done
-check 'pi message_update dropped' jq -se 'all(.[]; .type != "message_update")' "$log"
-check 'pi system message content trimmed' jq -se \
-  '[.[] | select(.message.role? == "system") | .message.content] == ["(trimmed)", "(trimmed)"]' "$log"
-check 'pi system message sections dropped' jq -se 'all(.[]; (.message.role? == "system" and (.message | has("sections"))) | not)' "$log"
-check 'pi agent_end messages emptied' jq -se 'any(.[]; .type == "agent_end" and .messages == [])' "$log"
+check 'pi message_update dropped' bash -c 'jq -se "all(.[]; .type != \"message_update\")" "$@"' _ "${segs[@]}"
+check 'pi system message content trimmed' bash -c 'jq -se \
+  "[.[] | select(.message.role? == \"system\") | .message.content] == [\"(trimmed)\", \"(trimmed)\"]" "$@"' _ "${segs[@]}"
+check 'pi system message sections dropped' bash -c 'jq -se "all(.[]; (.message.role? == \"system\" and (.message | has(\"sections\"))) | not)" "$@"' _ "${segs[@]}"
+check 'pi agent_end messages emptied' bash -c 'jq -se "any(.[]; .type == \"agent_end\" and .messages == [])" "$@"' _ "${segs[@]}"
+check 'pi lifecycle file holds only orchestrator records' bash -c 'jq -se "all(.[]; .type | startswith(\"orchestrator.\")) and .[0].type == \"orchestrator.start\" and .[-1].type == \"orchestrator.exit\"" "$1"' _ "$log"
+live_base=${log##*/}
+check 'pi provider records are in segment 1' test -s "$live/orchestrator/${live_base%.jsonl}.1.jsonl"
 
 run agy 1 0
 check 'agy final status/response' jq -se 'any(.[]; .type == "orchestrator.final" and .status == "SUCCESS" and .response == "done" and .parse_error == false)' "$log"
@@ -198,8 +235,8 @@ check 'pi jq set-e abort records real status' records pi "$result"
 
 for executor in codex pi agy; do
   run "$executor" 1 0 FAKE_EMIT_SECRET=1
-  check "$executor secret absent" bash -c '! rg -F -e "$FAKE_SECRET" -e "$OPENROUTER_API_KEY" -e ghp_aaaaaaaaaaaaaaaaaaaa -e github_pat_aaaaaaaaaaaaaaaaaaaa -e AIzaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -e xoxb-aaaaaaaaaa "$1"' _ "$log"
-  check "$executor log remains valid JSON" jq -se 'length > 1' "$log"
+  check "$executor secret absent" bash -c '! rg -F -e "$FAKE_SECRET" -e "$OPENROUTER_API_KEY" -e ghp_aaaaaaaaaaaaaaaaaaaa -e github_pat_aaaaaaaaaaaaaaaaaaaa -e AIzaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -e xoxb-aaaaaaaaaa "$1" "${@:2}"' _ "$log" "${segs[@]}"
+  check "$executor log remains valid JSON" jq -se 'length > 1' "$log" "${segs[@]}"
 done
 # agy has one JSON envelope; put secrets inside its response to exercise final redaction.
 secret_fixture=$tmp/secret-fixture
@@ -252,6 +289,107 @@ for executor in codex pi agy; do
   check "$executor timeout exit record" records "$executor" 124
 done
 
+# --- segmented event files ---
+seg_count() { find "$1" -maxdepth 1 -type f -name "${2%.jsonl}.*.jsonl" | wc -l; }
+seg_all_json() { jq -e . "$@" >/dev/null; }
+seg_each_max() {
+  local limit=$1 f; shift
+  for f; do (( $(stat -c %s "$f") <= limit )) || return 1; done
+}
+seg_all_mode() {
+  local f; for f; do [[ $(stat -c %a "$f") == 600 ]] || return 1; done
+}
+highest_seg() { local f n=0; for f; do f=${f##*/}; f=${f#*.}; f=${f%.jsonl}; ((f > n)) && n=$f; done; printf '%s' "$n"; }
+exit_segments() { jq -s -r '.[-1].segments' "$1"; }
+
+for executor in codex pi agy; do
+  run "$executor" 1 0
+  check "$executor lifecycle holds only orchestrator records" jq -se \
+    'all(.[]; .type | startswith("orchestrator.")) and .[0].type == "orchestrator.start" and .[-1].type == "orchestrator.exit"' "$log"
+  if [[ $executor == agy ]]; then
+    check 'agy has no segments' test "${#segs[@]}" = 0
+    check 'agy exit segments == 0' test "$(exit_segments "$log")" = 0
+  else
+    check "$executor provider records in segment 1" test -s "${log%.jsonl}.1.jsonl"
+    check "$executor exit segments == 1" test "$(exit_segments "$log")" = 1
+  fi
+  check "$executor segment mode 0600" seg_all_mode "${segs[@]}"
+done
+
+# Noisy run: >4 MiB of provider JSON, small segments, few kept.
+noise=5000
+for executor in codex pi; do
+  run "$executor" 0 3 FAKE_NOISY=$noise
+  baseline
+  run "$executor" 1 3 FAKE_NOISY=$noise ORCH_RUNLOG_SEGMENT_BYTES=262144 ORCH_RUNLOG_KEEP_SEGMENTS=3
+  segdir=${log%/*}
+  check "$executor noisy stdout/stderr/status unchanged" same_as
+  check "$executor noisy exit code 3" test "$result" = 3
+  check "$executor noisy lifecycle small (<8 KiB)" test "$(stat -c %s "$log")" -lt 8192
+  check "$executor noisy lifecycle only orchestrator" jq -se 'all(.[]; .type | startswith("orchestrator."))' "$log"
+  check "$executor noisy lifecycle exit_code 3" jq -se '.[-1].exit_code == 3' "$log"
+  check "$executor noisy kept at most 3 segments" test "$(seg_count "$segdir" "${log##*/}")" -le 3
+  check "$executor noisy at least 2 segments" test "$(seg_count "$segdir" "${log##*/}")" -ge 2
+  check "$executor noisy segments bounded (2x size)" seg_each_max 524288 "${segs[@]}"
+  check "$executor noisy every segment line valid JSON" seg_all_json "${segs[@]}"
+  check "$executor noisy exit segments == highest segment" test "$(exit_segments "$log")" = "$(highest_seg "${segs[@]}")"
+  check "$executor noisy final provider record in newest segment" \
+    jq -e --argjson i $((noise-1)) 'select(.type == "test.noise" and .i == $i)' "${segs[${#segs[@]}-1]}"
+done
+
+# Oversize: one provider line larger than the segment size.
+for executor in codex pi; do
+  run "$executor" 0 0 FAKE_BIGLINE=8192
+  baseline
+  run "$executor" 1 0 FAKE_BIGLINE=8192 ORCH_RUNLOG_SEGMENT_BYTES=4096
+  check "$executor oversize stdout/stderr/status unchanged" same_as
+  check "$executor oversize provider line absent" bash -c '! cat -- "$@" | grep -q "xxxxxxxxxx"' _ "${segs[@]}"
+  check "$executor oversize placeholder present" jq -se \
+    'any(.[]; .type == "orchestrator.oversize" and .bytes > 4096 and .provider_type == "test.big" and .v == 1 and (.ts | type == "string"))' "${segs[@]}"
+  check "$executor oversize segments bounded" seg_each_max 8192 "${segs[@]}"
+done
+
+# A segment that cannot be written mid-run must not disturb the wrapper.
+for executor in codex pi; do
+  run "$executor" 0 3 FAKE_BULK=3000
+  baseline
+  sfail=$tmp/segfail-$executor
+  mkdir -m 700 "$sfail"
+  # Make the log directory unwritable as soon as the lifecycle file exists.
+  (
+    for ((i=0; i<3000; i++)); do
+      d=$sfail/orchestrator
+      if [[ -d $d ]] && compgen -G "$d/*.jsonl" >/dev/null; then chmod 500 "$d"; exit 0; fi
+      sleep .002
+    done
+    exit 1
+  ) &
+  watcher=$!
+  stdout=$tmp/stdout-$serial stderr=$tmp/stderr-$serial result=0
+  env XDG_RUNTIME_DIR="$sfail" ORCH_RUNLOG=1 FAKE_RC=3 FAKE_BULK=3000 FAKE_FINISHED="$tmp/segdrain-$executor" \
+    ORCH_RUNLOG_SEGMENT_BYTES=262144 bash "$tmp/scripts/run_$executor.sh" "$tmp/prompt.txt" "$tmp/work" \
+    > "$stdout" 2> "$stderr" || result=$?
+  wait "$watcher"; segfail_armed=$?
+  chmod 700 "$sfail/orchestrator" 2>/dev/null || true
+  log=$(find "$sfail" -type f -name '*.jsonl' ! -name '*.*.jsonl' -print -quit)
+  check "$executor segment failure stdout/stderr/status unchanged" same_as
+  check "$executor segment failure drains worker" test -f "$tmp/segdrain-$executor"
+  check "$executor segment failure exit still recorded" records "$executor" 3
+  check "$executor segment failure was actually injected" test "$segfail_armed" = 0
+  check "$executor segment failure wrote no segment" test -z "$(find "$sfail" -type f -name '*.jsonl' ! -name '*.jsonl.1.jsonl' -name '*.[0-9]*.jsonl' -print -quit)"
+done
+
+# Pi silent timeout: nothing on stdout, must still exit 124 (not 1).
+run pi 0 0 ORCH_TIMEOUT=1 FAKE_SLEEP=5 FAKE_SILENT=1
+baseline
+check 'pi silent timeout (logging off) returns 124' test "$result" = 124
+run pi 1 0 ORCH_TIMEOUT=1 FAKE_SLEEP=5 FAKE_SILENT=1
+check 'pi silent timeout stdout/stderr/status unchanged' same_as
+check 'pi silent timeout returns 124 (not 1)' test "$result" = 124
+check 'pi silent timeout exit record 124/timed_out' jq -se \
+  'any(.[]; .type == "orchestrator.exit" and .exit_code == 124 and .timed_out == true)' "$log"
+check 'pi silent timeout lifecycle only orchestrator' jq -se 'all(.[]; .type | startswith("orchestrator."))' "$log"
+
 parallel=$tmp/parallel
 mkdir -m 700 "$parallel"
 env XDG_RUNTIME_DIR="$parallel" ORCH_RUNLOG=1 bash "$tmp/scripts/run_codex.sh" "$tmp/prompt.txt" "$tmp/work" > "$tmp/parallel1.out" 2> "$tmp/parallel1.err" &
@@ -259,8 +397,15 @@ one=$!
 env XDG_RUNTIME_DIR="$parallel" ORCH_RUNLOG=1 bash "$tmp/scripts/run_codex.sh" "$tmp/prompt.txt" "$tmp/work" > "$tmp/parallel2.out" 2> "$tmp/parallel2.err" &
 two=$!
 wait "$one"; wait "$two"
-check 'concurrent launches create distinct files' test "$(find "$parallel" -name '*.jsonl' | wc -l)" = 2
-check 'concurrent launches have distinct run ids' test "$(jq -r 'select(.type == "orchestrator.start") | .run_id' "$parallel"/orchestrator/*.jsonl | sort -u | wc -l)" = 2
+parallel_lifecycle() { find "$parallel" -type f -name '*.jsonl' ! -name '*.*.jsonl'; }
+check 'concurrent launches create distinct files' test "$(parallel_lifecycle | wc -l)" = 2
+check 'concurrent launches create distinct segments' \
+  test "$(find "$parallel" -type f -name '*.[0-9]*.jsonl' | wc -l)" = 2
+distinct_run_ids() {
+  local f
+  for f in $(parallel_lifecycle); do jq -r 'select(.type == "orchestrator.start") | .run_id' "$f"; done | sort -u | wc -l
+}
+check 'concurrent launches have distinct run ids' test "$(distinct_run_ids)" = 2
 
 run codex 1 0 ORCH_LABEL='custom label' ORCH_PARENT=parent-task
 check 'explicit label/parent' jq -se '.[0].label == "custom label" and .[0].parent == "parent-task"' "$log"

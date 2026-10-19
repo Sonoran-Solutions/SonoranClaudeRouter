@@ -21,6 +21,6 @@ _runlog_init pi "$p" "$w" "$m"
 cd "$w"
 ev=$(_runlog_run timeout "${ORCH_TIMEOUT:-900}" pi -p --provider openrouter --model "$m" --no-session --no-extensions \
   --no-skills --no-context-files ${ORCH_PI_NO_TOOLS:+--no-tools} --mode json "$(cat "$p")" 2>/dev/null) \
-  || { rc=$?; echo "pi failed or timed out (rc=$rc)" >&2; printf '%s\n' "$ev" | grep -i error | tail -3 | cut -c1-300 >&2; exit $rc; }
+  || { rc=$?; echo "pi failed or timed out (rc=$rc)" >&2; printf '%s\n' "$ev" | { grep -i error || true; } | tail -3 | cut -c1-300 >&2; exit $rc; }
 printf '%s\n' "$ev" | jq -r 'select(.type=="message_end" and .message.role=="assistant") | [.message.content[]? | select(.type=="text") | .text] | join("\n")' | awk 'NF' | tail -n 1
 printf '%s\n' "$ev" | jq -rs '[.[] | select(.type=="message_end" and .message.role=="assistant") | .message.usage.cost.total // 0] | "pi cost_usd=\(add|.*1e6|round/1e6) model='"$m"'"' >&2 || true
