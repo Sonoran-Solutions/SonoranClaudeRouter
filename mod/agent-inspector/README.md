@@ -41,6 +41,8 @@ Checks: `claude plugin validate mod/agent-inspector` and `claude plugin test mod
 
 ## Limitations
 
+- **Pane size.** The supported minimum pane size is 12 rows x 70 columns; below 24 rows the usage line, worker rows,
+  run summary and controls are single truncated lines.
 - **Read-only.** No tool or session-append hooks; no steering, cancellation, model switching or file writes. The
   only process it runs is `usage.sh` (a read-only status script that prints one JSON line and never prints keys),
   only while the pane is placed. The `agent.spawn` hook only observes: it forwards the spawn exactly once and returns

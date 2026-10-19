@@ -1,6 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, RenderPropsOf } from 'claude-code'
+import { paneBudget } from '../hooks/register'
+import type { PaneBudgetInput } from '../hooks/register'
 
 const NOW = Date.UTC(2026, 9, 19, 19, 32, 0)
 const SCRIPT = '/home/dq/.claude/skills/orchestrator/scripts/usage.sh'
@@ -256,6 +258,104 @@ test('short panes: Usage is one compact line, the refresh button stays, and the 
   expect((await ui.find({ type: 'Box', key: 'usage:compact' }))?.text).toMatch(/· error/)
   expect(await ui.find({ text: /usage\.sh: / })).toBeUndefined()
   await ui.unmount()
+})
+
+test('paneBudget never budgets more rows than the body has', () => {
+  const selections: PaneBudgetInput['selection'][] = ['run', 'claude', 'none']
+  for (let rows = 12; rows <= 40; rows++) {
+    for (const width of [70, 100]) {
+      for (const hasNotice of [false, true]) {
+        for (const hasUsageError of [false, true]) {
+          for (const groups of [1, 2]) {
+            for (const ids of [1, 5]) {
+              for (const selection of selections) {
+                const input = { rows, width, hasNotice, hasUsageError, groups, ids, selection }
+                const b = paneBudget(input)
+                const at = JSON.stringify(input)
+                const total = b.fixed + groups + Math.min(b.listRoom, ids) + b.eventRoom
+                expect(total <= rows, `${at} -> ${total} > ${rows}`).toBe(true)
+                expect(Math.min(b.listRoom, ids) >= 1, at).toBe(true)
+                if (selection === 'run') expect(b.eventRoom >= 3, at).toBe(true)
+                expect(b.isCompact).toBe(rows < 24)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  // The reviewer's case: 12 rows, one worker, its compact summary and events.
+  const b = paneBudget({ rows: 12, width: 100, hasNotice: false, hasUsageError: false, groups: 1, ids: 1, selection: 'run' })
+  expect(b.isCompact).toBe(true)
+  expect(b.fixed + 1 + Math.min(b.listRoom, 1) + b.eventRoom <= 12).toBe(true)
+  expect(b.eventRoom >= 3).toBe(true)
+})
+
+/**
+ * How many rows a tree estimates to: a Text is one line (wrapping at `width`),
+ * a Button one line, and a Box stacks its children unless it lays them in a row
+ * (then its texts and buttons share one line, the tallest winning).
+ */
+function drawnRows(tree: unknown, width: number): number {
+  if (typeof tree === 'string') return 1
+  if (tree === null || typeof tree !== 'object') return 0
+  const el = tree as { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+  const children = el.children ?? []
+  if (el.type === 'Button') return 1
+  if (el.type === 'Text') {
+    let longest = 1
+    for (const child of children) {
+      if (typeof child === 'string') longest = Math.max(longest, ...child.split('\n').map(line => line.length))
+    }
+    return Math.max(1, Math.ceil(longest / width))
+  }
+  if (el.props?.flexDirection === 'row') {
+    // Strings and inline Texts share the line; a nested Box starts its own.
+    let rows = 1
+    for (const child of children) {
+      if (typeof child !== 'object' || child === null) continue
+      if ((child as { type?: string }).type === 'Box') rows += drawnRows(child, width)
+    }
+    return rows
+  }
+  let rows = 0
+  for (const child of children) rows += drawnRows(child, width)
+  return rows
+}
+
+test('a 12-row, 70-column pane draws within its body, even for one very long newest event', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  const id = '20261019T171901000Z-codex-00000001'
+  const line = (r: object) => `${JSON.stringify(r)}\n`
+  w.files.set(`${id}.jsonl`, line({
+    v: 1, type: 'orchestrator.start', run_id: id, executor: 'codex', model: 'gpt-5.5', label: 'a-very-long-task-label-that-would-wrap',
+    parent: null, workdir: '/tmp/w', pid: 4242, granularity: 'live', ts: '2026-10-19T17:19:00.000Z',
+  }))
+  w.files.set(`${id}.1.jsonl`, line({ type: 'item.completed', item: { id: '1', type: 'agent_message', text: 'word '.repeat(1200) } }))
+  await $.session.start(BOOT)
+  await clock.advance(1000)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({
+      plugin: 'agent-inspector', surface, component: 'Pane', requestId: 'agent-inspector',
+      props: { ...PANE, bodyColumns: 70, scroll: { offset: 0, bodyRows: 12 } }, viewport: { columns: 80, rows: 14 },
+    })
+    const tree = await ui.drawn()
+    const parts = (tree as { children?: unknown[] }).children ?? []
+    expect(drawnRows(tree, 70), parts.map(one => drawnRows(one, 70)).join(',')).toBeLessThanOrEqual(12)
+    // The compact run summary is one line, and the newest event is cut to fit.
+    const texts = (await ui.findAll({ type: 'Text' })).map(one => one.text)
+    expect(texts.some(one => /running · live · last event .* · reported —$/.test(one))).toBe(true)
+    const cut = texts.find(one => /… \[x to expand\]$/.test(one)) ?? ''
+    expect(cut).toMatch(/^word /)
+    // It is cut to the room, not just to the 2000-character display limit.
+    expect(cut.length).toBeLessThan(2000)
+    // Compact controls fit one 70-column line.
+    const labels = (await ui.findAll({ type: 'Button' })).map(one => one.text)
+    expect(labels).toContain('f on')
+    expect(labels.join(' ').length).toBeLessThanOrEqual(70)
+    await ui.unmount()
+  }
 })
 
 /** A process.run that stays pending until `release()`. */

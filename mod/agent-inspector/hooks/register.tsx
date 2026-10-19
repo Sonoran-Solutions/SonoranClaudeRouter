@@ -59,9 +59,47 @@ const QUIET_MS = 30_000
 // with another skills dir or a different cadence edits these two constants;
 // upgrade path is a userConfig field (plugin.json) read with $.settings.
 const USAGE_REFRESH_MS = 5 * 60_000
+/** The marker an event cut to fit its room ends with. */
+const CUT_MARKER = '… [x to expand]'
 /** Below this many body rows the Usage section is a single line. */
 const COMPACT_BELOW_ROWS = 24
 const USAGE_SCRIPT = '.claude/skills/orchestrator/scripts/usage.sh' // under $HOME
+
+// ---------------------------------------------------------------------------
+// Pane budget: how many rows each section may take, so the drawing never
+// outgrows the body (supported minimum: 12 rows x 70 columns).
+
+export type PaneBudgetInput = {
+  rows: number
+  width: number
+  hasNotice: boolean
+  hasUsageError: boolean
+  groups: number
+  ids: number
+  selection: 'none' | 'run' | 'claude'
+}
+
+export type PaneBudget = { isCompact: boolean; fixed: number; listRoom: number; eventRoom: number }
+
+/**
+ * The rows every non-list section claims, one per rendered line in compact
+ * mode and the full-sized sections above it.
+ */
+export function paneBudget(input: PaneBudgetInput): PaneBudget {
+  const { rows, width, hasNotice, hasUsageError, groups, ids, selection } = input
+  const isCompact = rows < COMPACT_BELOW_ROWS
+  const usage = isCompact ? 1 : 5 + (hasUsageError ? 1 : 0)
+  const controls = isCompact ? 1 : width < 70 ? 2 : 1
+  // claudeDetail and runDetail are 4 lines; compact panes draw one line each.
+  const summary = selection === 'none' ? 1 : isCompact ? 1 : 4
+  const fixed = 1 + (hasNotice ? 1 : 0) + usage + 1 + controls + summary
+  const spare = rows - fixed - groups
+  const cap = Math.max(3, Math.floor(rows / 3))
+  const listRoom = Math.max(1, Math.min(cap, spare - 3, ids))
+  let eventRoom = Math.max(isCompact ? 1 : 3, spare - Math.min(listRoom, ids))
+  if (fixed + groups + Math.min(listRoom, ids) + eventRoom > rows) eventRoom -= 1
+  return { isCompact, fixed, listRoom, eventRoom }
+}
 
 const RUNS = atom({ plugin: 'agent-inspector', key: 'runs' } as const, [])
 const CLAUDE = atom({ plugin: 'agent-inspector', key: 'claude' } as const, [])
@@ -499,20 +537,22 @@ export const register: Register = on => {
     const ids = [...runs.map(run => run.id), ...claude.map(agent => `claude:${agent.id}`)]
     const selected = currentSelection(view, ids)
     const width = Math.max(24, e.props.bodyColumns)
-    const rows = Math.max(12, e.props.scroll.bodyRows)
+    const rows = Math.max(1, e.props.scroll.bodyRows)
+    // Short panes: Usage collapses to one line so the event list keeps its room, and
+    // every fixed row is drawn on exactly one line (truncated at the edge).
+    const isCompact = rows < COMPACT_BELOW_ROWS
+    const truncate = isCompact ? ('truncate-end' as const) : undefined
     const header = (
       <Box flexDirection="row" justifyContent="space-between">
-        <Text bold>
+        <Text bold wrap={truncate}>
           {TITLE} <Text dimColor>· read-only · {runs.length} run{runs.length === 1 ? '' : 's'} · {claude.length} Claude agent{claude.length === 1 ? '' : 's'}</Text>
         </Text>
-        {status.polledAt !== null && <Text dimColor>polled {clockTime(status.polledAt)}</Text>}
+        {status.polledAt !== null && <Text dimColor wrap={truncate}>polled {clockTime(status.polledAt)}</Text>}
       </Box>
     )
 
     const notice = dirNotice(status)
 
-    // Short panes: Usage collapses to one line so the event list keeps its room.
-    const isCompact = rows < COMPACT_BELOW_ROWS
     const refresh = (
       <Button key="refresh" plain hotkey="r" label={usage.isRefreshing ? 'refreshing…' : isCompact ? 'r' : 'r refresh'} onPress={() => refreshNow($)} />
     )
@@ -527,36 +567,41 @@ export const register: Register = on => {
     )
 
     // Fixed rows first (header, notice, usage, separator, controls, run detail
-    // summary); the worker list and the event list share what is left, the
-    // event list keeping at least 3 rows and the list at least the selection.
+    // summary); the worker list and the event list share what is left (see
+    // paneBudget).
     const hasError = usage.error !== null
     const groups = (runs.length > 0 ? 1 : 0) + (claude.length > 0 ? 1 : 0)
-    const fixed =
-      1 + (notice !== null ? 1 : 0) + (isCompact ? 1 : 5 + (hasError ? 1 : 0)) + 1 + (width < 70 ? 2 : 1) + (selected === null ? 1 : 4)
-    const listRoom = Math.max(1, Math.min(Math.max(3, Math.floor(rows / 3)), rows - fixed - 3 - groups))
-    const window = listWindow(ids, selected, listRoom)
-    const used = fixed + window.length + groups
+    const budget = paneBudget({
+      rows,
+      width,
+      hasNotice: notice !== null,
+      hasUsageError: hasError,
+      groups,
+      ids: ids.length,
+      selection: selected === null ? 'none' : selected.startsWith('claude:') ? 'claude' : 'run',
+    })
+    const window = listWindow(ids, selected, budget.listRoom)
     const runRows = runs.filter(run => window.includes(run.id))
     const claudeRows = claude.filter(agent => window.includes(`claude:${agent.id}`))
 
     const controls = (
-      <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-        <Button key="prev" plain hotkey="k" label="prev" onPress={() => moveSelection($, -1)} />
-        <Button key="next" plain hotkey="j" label="next" onPress={() => moveSelection($, 1)} />
-        <Button key="older" plain hotkey="u" label="older" onPress={() => scrollEvents($, -5)} />
-        <Button key="newer" plain hotkey="d" label="newer" onPress={() => scrollEvents($, 5)} />
+      <Box flexDirection="row" flexWrap={isCompact ? 'nowrap' : 'wrap'} columnGap={1}>
+        <Button key="prev" plain hotkey="k" label={isCompact ? 'k' : 'prev'} onPress={() => moveSelection($, -1)} />
+        <Button key="next" plain hotkey="j" label={isCompact ? 'j' : 'next'} onPress={() => moveSelection($, 1)} />
+        <Button key="older" plain hotkey="u" label={isCompact ? 'u' : 'older'} onPress={() => scrollEvents($, -5)} />
+        <Button key="newer" plain hotkey="d" label={isCompact ? 'd' : 'newer'} onPress={() => scrollEvents($, 5)} />
         <Button
           key="follow"
           plain
           hotkey="f"
-          label={view.anchorSeq === null ? 'follow: on' : 'follow: off'}
+          label={isCompact ? (view.anchorSeq === null ? 'f on' : 'f off') : view.anchorSeq === null ? 'follow: on' : 'follow: off'}
           onPress={() => toggleFollow($)}
         />
         <Button
           key="expand"
           plain
           hotkey="x"
-          label={view.isExpanded ? 'expand: on' : 'expand: off'}
+          label={isCompact ? (view.isExpanded ? 'x on' : 'x off') : view.isExpanded ? 'expand: on' : 'expand: off'}
           onPress={() => update($, VIEW, v => ({ ...v, isExpanded: !v.isExpanded }))}
         />
       </Box>
@@ -564,18 +609,22 @@ export const register: Register = on => {
 
     let detail: RenderElement | null = null
     if (selected === null) {
-      detail = <Text dimColor>{emptyText(status)}</Text>
+      detail = (
+        <Text dimColor wrap={truncate}>
+          {emptyText(status)}
+        </Text>
+      )
     } else if (selected.startsWith('claude:')) {
       const agent = claude.find(one => `claude:${one.id}` === selected)
-      detail = agent === undefined ? null : claudeDetail(Text, Box, agent)
+      detail = agent === undefined ? null : claudeDetail(Text, Box, agent, truncate)
     } else {
       const run = runs.find(one => one.id === selected)!
       const events = await readEvents($, run.id)
-      const summary = runDetail(Text, Box, run, now)
+      const summary = isCompact ? runDetailLine(Text, run, now) : runDetail(Text, Box, run, now)
       detail = (
         <Box flexDirection="column">
           {summary}
-          {eventList(Text, Box, events, view, Math.max(3, rows - used), width, run.segmentsOmitted ?? 0)}
+          {eventList(Text, Box, events, view, budget, width, run.segmentsOmitted ?? 0)}
         </Box>
       )
     }
@@ -583,11 +632,19 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" width={width}>
         {header}
-        {notice !== null && <Text color="warning">{notice}</Text>}
+        {notice !== null && (
+          <Text color="warning" wrap={truncate}>
+            {notice}
+          </Text>
+        )}
         {isCompact ? compactUsage(Text, Box, usage, refresh) : usageHeader}
         {!isCompact && hasError && <Text color="error">usage.sh: {usage.error} (showing the last good figures)</Text>}
         {!isCompact && usageRows(Text, Box, usage, now)}
-        {runRows.length > 0 && <Text dimColor>External workers</Text>}
+        {runRows.length > 0 && (
+          <Text dimColor wrap={truncate}>
+            External workers
+          </Text>
+        )}
         {runRows.map(run => (
           <Box key={`row:${run.id}`} flexDirection="row" columnGap={1}>
             <Button
@@ -596,7 +653,7 @@ export const register: Register = on => {
               label={`${run.id === selected ? '▸' : ' '} ${run.executor}`}
               onPress={() => update($, VIEW, v => ({ ...v, selected: run.id, anchorSeq: null }))}
             />
-            <Text>
+            <Text wrap={truncate}>
               <Text dimColor>{run.model ?? 'default model'}</Text> {run.label ?? run.id.slice(-8)}{' '}
               <Text dimColor>{formatDuration(now - run.startedAt)}</Text> <Text color={stateColor(run)}>{stateLabel(run)}</Text>{' '}
               <Text color={run.granularity === 'final-only' ? 'warning' : 'subtle'}>[{run.granularity}]</Text>
@@ -604,7 +661,11 @@ export const register: Register = on => {
             </Text>
           </Box>
         ))}
-        {claudeRows.length > 0 && <Text dimColor>Claude agents</Text>}
+        {claudeRows.length > 0 && (
+          <Text dimColor wrap={truncate}>
+            Claude agents
+          </Text>
+        )}
         {claudeRows.map(agent => (
           <Box key={`row:claude:${agent.id}`} flexDirection="row" columnGap={1}>
             <Button
@@ -613,7 +674,7 @@ export const register: Register = on => {
               label={`${`claude:${agent.id}` === selected ? '▸' : ' '} ${agent.type}`}
               onPress={() => update($, VIEW, v => ({ ...v, selected: `claude:${agent.id}`, anchorSeq: null }))}
             />
-            <Text>
+            <Text wrap={truncate}>
               <Text dimColor>{agent.model ?? 'model not reported'}</Text> {agent.description}{' '}
               <Text dimColor>{agent.status ?? 'status not reported'}</Text>
             </Text>
@@ -682,35 +743,46 @@ const tightest = (windows: readonly UsageWindow[]): UsageWindow | undefined => w
 /** One line: "Usage · Claude 49% · Codex 69% · agy 0% (5h) · OR $16.31 · r" (remaining; ? when unknown). */
 function compactUsage(Text: TextC, Box: BoxC, usage: UsageState, refresh: RenderElement): RenderElement {
   const s = usage.script
+  const T = ({ children, ...props }: { children: RenderElement | string; dimColor?: boolean; color?: string; bold?: boolean }) => (
+    <Text wrap="truncate-end" {...props}>
+      {children}
+    </Text>
+  )
   const pct = (name: string, windows: readonly UsageWindow[], withScope = false): RenderElement => {
     const w = tightest(windows)
-    if (w === undefined) return <Text dimColor>{name} ?</Text>
+    if (w === undefined)
+      return (
+        <Text dimColor wrap="truncate-end">
+          {name} ?
+        </Text>
+      )
     return (
-      <Text>
-        {name} <Text color={usageColor(w.usedPct)}>{Math.max(0, Math.round(100 - w.usedPct))}%</Text>
+      <Text wrap="truncate-end">
+        {name}{' '}
+        <Text color={usageColor(w.usedPct)}>{Math.max(0, Math.round(100 - w.usedPct))}%</Text>
         {withScope && w.scope !== undefined ? ` (${w.scope})` : ''}
       </Text>
     )
   }
   const credits = s?.openrouter.credits ?? null
   return (
-    <Box key="usage:compact" flexDirection="row" flexWrap="wrap" columnGap={1}>
-      <Text bold>Usage</Text>
-      <Text dimColor>·</Text>
+    <Box key="usage:compact" flexDirection="row" flexWrap="nowrap" columnGap={1}>
+      <T bold>Usage</T>
+      <T dimColor>·</T>
       {pct('Claude', usage.claude)}
-      <Text dimColor>·</Text>
+      <T dimColor>·</T>
       {pct('Codex', s?.codex.windows ?? [])}
-      <Text dimColor>·</Text>
+      <T dimColor>·</T>
       {pct('agy', s?.agy.windows ?? [], true)}
-      <Text dimColor>·</Text>
+      <T dimColor>·</T>
       {credits === null ? (
-        <Text dimColor>OR ?</Text>
+        <T dimColor>OR ?</T>
       ) : (
-        <Text>
+        <Text wrap="truncate-end">
           OR <Text color={usageColor(null, credits.remainingUsd)}>${credits.remainingUsd.toFixed(2)}</Text>
         </Text>
       )}
-      {usage.error !== null && <Text dimColor>· error</Text>}
+      {usage.error !== null && <T dimColor>· error</T>}
       {refresh}
     </Box>
   )
@@ -805,6 +877,17 @@ function runDetail(Text: TextC, Box: BoxC, run: RunSummary, now: number): Render
   )
 }
 
+/** The compact run summary: one truncated line instead of runDetail's four. */
+function runDetailLine(Text: TextC, run: RunSummary, now: number): RenderElement {
+  const last = run.lastEventAt
+  return (
+    <Text wrap="truncate-end">
+      <Text color={stateColor(run)}>{stateLabel(run)}</Text> · <Text color={run.granularity === 'final-only' ? 'warning' : 'subtle'}>{run.granularity}</Text> · last event{' '}
+      {last === null ? 'none' : `${formatDuration(now - last)} ago`} · reported {run.reported ?? '—'}
+    </Text>
+  )
+}
+
 const KIND_COLOR: Record<string, string> = {
   message: 'text',
   'reasoning summary': 'remember',
@@ -821,10 +904,13 @@ function eventList(
   Box: BoxC,
   events: RunEvents,
   view: InspectorView,
-  room: number,
+  budget: PaneBudget,
   width: number,
   segmentsOmitted: number,
 ): RenderElement {
+  const room = budget.eventRoom
+  // Leave the last row for the "more above" marker; below two rows nothing fits.
+  const lines = Math.max(0, room - 1)
   const items = events.items
   const lost =
     segmentsOmitted > 0
@@ -836,17 +922,31 @@ function eventList(
       ? items.length
       : Math.max(1, items.findIndex(one => one.seq > view.anchorSeq!) === -1 ? items.length : items.findIndex(one => one.seq > view.anchorSeq!))
   const limit = view.isExpanded ? MAX_STORED_CHARS : SHOWN_CHARS
-  // Fill the room from the anchor backwards, estimating wrapped lines.
-  const shown: DisplayEvent[] = []
-  let left = room - 1
+  // The first (newest) event must fit too: if it does not, its text is cut so the
+  // header and the text fit in room - 1 rows, the last row staying for the "more
+  // above" marker. One that does not fit even then is dropped with a note.
+  const fitted: DisplayEvent[] = []
+  const shownLines = new Map<number, string>()
+  let left = lines
   for (let i = end - 1; i >= 0; i--) {
     const one = items[i]!
-    const cost = 1 + lineCount(shownText(one, limit), width)
-    if (shown.length > 0 && cost > left) break
-    shown.unshift(one)
+    const text = shownText(one, limit)
+    const cost = 1 + lineCount(text, width)
+    if (fitted.length === 0 && cost > left) {
+      // The newest event is taller than the room: keep its header and the
+      // longest prefix, marker included, that fits in the rows left.
+      if (left >= 2) {
+        const keep = Math.min(text.length - CUT_MARKER.length, (left - 1) * width - CUT_MARKER.length)
+        fitted.unshift(one)
+        shownLines.set(one.seq, `${text.slice(0, keep).trimEnd()}${CUT_MARKER}`)
+      }
+      break
+    }
+    if (fitted.length > 0 && cost > left) break
+    fitted.unshift(one)
     left -= cost
   }
-  const above = end - shown.length
+  const above = end - fitted.length
   const below = items.length - end
   const older = [
     lost,
@@ -856,16 +956,16 @@ function eventList(
   return (
     <Box flexDirection="column">
       {older.length > 0 && <Text dimColor>{older.join(' · ')}</Text>}
-      {shown.map(one => (
+      {fitted.map(one => (
         <Box key={`ev:${one.seq}`} flexDirection="column">
-          <Text>
+          <Text wrap="truncate-end">
             <Text dimColor>{clockTime(one.at)} </Text>
             <Text bold color={one.isError ? 'error' : KIND_COLOR[one.kind]}>
               {one.kind}
             </Text>
             {one.role !== undefined ? <Text dimColor> ({one.role})</Text> : ''}
           </Text>
-          <Text>{shownText(one, limit)}</Text>
+          <Text>{shownLines.get(one.seq) ?? shownText(one, limit)}</Text>
         </Box>
       ))}
       {below > 0 && <Text dimColor>{below} newer event{below === 1 ? '' : 's'} below (f to follow)</Text>}
@@ -882,18 +982,19 @@ function lineCount(text: string, width: number): number {
   return text.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(line.length / width)), 0)
 }
 
-function claudeDetail(Text: TextC, Box: BoxC, agent: ClaudeAgent): RenderElement {
+/** Four one-line fields (truncated when the pane is compact), so four rows at most. */
+function claudeDetail(Text: TextC, Box: BoxC, agent: ClaudeAgent, wrap?: 'truncate-end'): RenderElement {
   return (
     <Box flexDirection="column">
-      <Text>
+      <Text wrap={wrap}>
         <Text bold>Claude agent</Text> {agent.type} · {agent.model ?? 'model not reported'} · {agent.status ?? 'status not reported'}
       </Text>
-      <Text>{agent.description || '(no description)'}</Text>
-      <Text dimColor>
+      <Text wrap={wrap}>{agent.description || '(no description)'}</Text>
+      <Text dimColor wrap={wrap}>
         id {agent.id} · parent {agent.parentId ?? 'main conversation'}
         {agent.spawnedAt !== null ? ` · seen ${clockTime(agent.spawnedAt)}` : ''}
       </Text>
-      <Text dimColor>Only what agent.spawn and the agent list expose; open its transcript from the tasks list.</Text>
+      <Text dimColor wrap={wrap}>Only what agent.spawn and the agent list expose; open its transcript from the tasks list.</Text>
     </Box>
   )
 }
