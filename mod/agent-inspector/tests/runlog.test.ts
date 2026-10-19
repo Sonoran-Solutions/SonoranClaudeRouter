@@ -189,6 +189,26 @@ describe('record mapping', () => {
     expect(run.exit?.code).toBe(0) // ...the observed exit status
   })
 
+  test('a capped agy final response adds a truncation warning beside the final', () => {
+    const response = 'r'.repeat(65536)
+    const final = JSON.stringify({
+      v: 1, type: 'orchestrator.final', run_id: 'x', ts: '2026-10-19T17:19:44.000Z',
+      status: 'SUCCESS', response, parse_error: false, response_truncated: true, response_chars: 5000000,
+    })
+    const { run, events } = ingest('agy', [start('agy'), final, exit(0)])
+    expect(events.items.map(one => one.kind)).toEqual(['status', 'final', 'warning', 'status'])
+    expect(events.items[1]?.text.startsWith('r'.repeat(MAX_STORED_CHARS))).toBe(true) // display limits still apply
+    expect(events.items[2]?.text).toBe(
+      'agy final response was 5000000 characters; the log keeps the first 65536 (the caller received all of it)',
+    )
+    expect(run.warnings).toBe(1)
+    expect(stateLabel(run)).toBe('exited 0')
+
+    // Older logs carry no flag: no warning.
+    const old = ingest('agy', [JSON.stringify({ v: 1, type: 'orchestrator.final', run_id: 'x', status: 'SUCCESS', response: 'done', parse_error: false })])
+    expect(old.events.items.map(one => one.kind)).toEqual(['final'])
+  })
+
   test('a timed-out run says so', () => {
     const { run } = ingest('codex', [start('codex'), exit(124)])
     expect(stateLabel(run)).toBe('timed out')

@@ -28,7 +28,13 @@ async function readFile(io: ReadIo, path: string, label: string, cursor: FileCur
     return {
       ...same,
       cursor: { ...cursor, isSkipped: true },
-      warnings: cursor.isSkipped ? [] : [`telemetry: ${label} is ${mib} MiB, over the 4 MiB read limit; skipped`],
+      warnings: cursor.isSkipped
+        ? []
+        : [
+            label === 'lifecycle file'
+              ? `telemetry: lifecycle file is ${mib} MiB, over the 4 MiB read limit; its start/exit records cannot be read, so this run's status is unknown (not failed)`
+              : `telemetry: ${label} is ${mib} MiB, over the 4 MiB read limit; skipped`,
+          ],
     }
   }
   let text: string

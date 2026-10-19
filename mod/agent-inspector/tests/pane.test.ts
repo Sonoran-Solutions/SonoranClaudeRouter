@@ -278,6 +278,51 @@ test('a read error on one run is a warning there; the other run still advances',
   expect(stateLabel(runs.get(BIG)!)).toBe('running')
 })
 
+const AGY2 = '20261019T171700000Z-agy-0000ca9e'
+const cappedFinal = (id: string) =>
+  line({
+    v: 1, type: 'orchestrator.final', run_id: id, ts: '2026-10-19T17:19:09.000Z', status: 'SUCCESS',
+    response: 'a'.repeat(65536), parse_error: false, response_truncated: true, response_chars: 4500000,
+  })
+
+test('agy with a capped final response: exited 0, final and truncation warning shown', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const files = new Map<string, File>([[`${AGY2}.jsonl`, { text: start(AGY2, 'agy', null) + cappedFinal(AGY2) + exit(AGY2, 0, 0) }]])
+  const w = world(on, files)
+  await $.session.start(BOOT)
+  await clock.advance(1000)
+  const run = (w.state.get('runs') as RunSummary[])[0]!
+  expect(stateLabel(run)).toBe('exited 0')
+  expect(run.reported).toBe('SUCCESS')
+  const events = w.state.get(`events:${AGY2}`) as RunEvents
+  expect(events.items.map(one => one.kind)).toEqual(['status', 'final', 'warning', 'status'])
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ plugin: 'agent-inspector', surface, component: 'Pane', requestId: 'agent-inspector', props: PANE })
+    expect((await ui.find({ type: 'Button', key: `sel:${AGY2}` }))?.text).toMatch(/exited 0.*\[final-only\]/)
+    expect(await ui.find({ type: 'Text', text: /^final$/ })).toBeDefined()
+    expect(await ui.find({ text: /agy final response was 4500000 characters; the log keeps the first 65536/ })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('a lifecycle file over the read limit (old uncapped log): status unknown with a clear warning', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const files = new Map<string, File>([[`${AGY2}.jsonl`, { text: '', size: 5 * MIB }]])
+  const w = world(on, files)
+  await $.session.start(BOOT)
+  await clock.advance(1000)
+  await clock.advance(1000)
+  const run = (w.state.get('runs') as RunSummary[])[0]!
+  expect(stateLabel(run)).toBe('unknown')
+  expect(run.exit).toBeNull()
+  expect(run.warnings).toBe(1) // once, not every poll
+  expect(w.reads).toEqual([])
+  const events = w.state.get(`events:${AGY2}`) as RunEvents
+  expect(events.items.map(one => one.text)).toEqual([
+    "telemetry: lifecycle file is 5.0 MiB, over the 4 MiB read limit; its start/exit records cannot be read, so this run's status is unknown (not failed)",
+  ])
+})
+
 test('no XDG_RUNTIME_DIR: the pane says the log directory is unavailable', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const w = world(on, baseFiles(), {})

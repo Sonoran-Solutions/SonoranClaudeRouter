@@ -278,7 +278,21 @@ function mapWrapper(type: string, r: Obj, run: RunSummary): Mapped {
         role: status === null ? undefined : `reported ${clean(status, 80)}`,
       }),
     )
-    return { events, patch: { reported: status === null ? run.reported : clean(status, 80) } }
+    const patch: Partial<RunSummary> = { reported: status === null ? run.reported : clean(status, 80) }
+    // The wrapper caps the logged response; older logs have no flag (false).
+    if (r.response_truncated === true) {
+      const full = num(r.response_chars)
+      const kept = response === null ? 0 : [...response].length
+      events.push(
+        ev(
+          'warning',
+          `agy final response was ${full ?? 'more than ' + kept} characters; the log keeps the first ${kept} (the caller received all of it)`,
+          { at },
+        ),
+      )
+      patch.warnings = run.warnings + 1
+    }
+    return { events, patch }
   }
   if (type === 'orchestrator.exit') {
     const code = num(r.exit_code) ?? -1
