@@ -554,7 +554,7 @@ export const register: Register = on => {
     const notice = dirNotice(status)
 
     const refresh = (
-      <Button key="refresh" plain hotkey="r" label={usage.isRefreshing ? 'refreshing…' : isCompact ? 'r' : 'r refresh'} onPress={() => refreshNow($)} />
+      <Button key="refresh" plain hotkey="r" label={usage.isRefreshing ? 'refreshing…' : isCompact ? '↻' : 'refresh'} onPress={() => refreshNow($)} />
     )
     const usageHeader = (
       <Box flexDirection="row" columnGap={1}>
