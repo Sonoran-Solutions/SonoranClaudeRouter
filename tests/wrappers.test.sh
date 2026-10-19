@@ -14,6 +14,8 @@ export OPENROUTER_API_KEY='literal.key[with]*regex+characters'
 export REAL_JQ
 REAL_JQ=$(command -v jq)
 unset ORCH_LABEL ORCH_PARENT ORCH_RUNLOG_RETENTION_MIN ORCH_TIMEOUT
+# Never read the real user's Claude Code transcripts.
+unset CLAUDE_CODE_SESSION_ID CLAUDE_CONFIG_DIR
 
 # One fake implementation, installed under each provider's executable name.
 cat > "$tmp/bin/provider" <<'FAKE'
@@ -161,6 +163,7 @@ records() {
     and ($s.pid | type == "number" and . > 0)
     and $s.label == "prompt.txt" and $s.parent == null
     and $s.model == (if $executor == "pi" then "test/resolved" else null end)
+    and $s.session_id == null and $s.session_title == null and $s.project == $workdir
     and $s.granularity == (if $executor == "agy" then "final-only" else "live" end)
     and $e.exit_code == $code and $e.timed_out == ($code == 124)
     and ($e.segments | type == "number" and . >= 0)
@@ -446,6 +449,26 @@ distinct_run_ids() {
   for f in $(parallel_lifecycle); do jq -r 'select(.type == "orchestrator.start") | .run_id' "$f"; done | sort -u | wc -l
 }
 check 'concurrent launches have distinct run ids' test "$(distinct_run_ids)" = 2
+
+# --- launching Claude Code session and its project ---
+session_uuid=04a49741-c222-4b87-869c-d9e2917d6af9
+fake_claude=$tmp/fake-claude
+mkdir -p "$fake_claude/projects/-x-proj"
+{
+  jq -nc '{type:"user", cwd:"/x/proj", message:{role:"user"}}'
+  jq -nc '{type:"custom-title", customTitle:"Old name", sessionId:"'"$session_uuid"'"}'
+  jq -nc --arg pad "$(head -c 2000 /dev/zero | tr '\0' 'p')" '{type:"assistant", pad:$pad, message:{role:"assistant"}}'
+  jq -nc '{type:"custom-title", customTitle:"New name", sessionId:"'"$session_uuid"'"}'
+} > "$fake_claude/projects/-x-proj/$session_uuid.jsonl"
+run codex 1 0 CLAUDE_CODE_SESSION_ID="$session_uuid" CLAUDE_CONFIG_DIR="$fake_claude"
+check 'session id/title/project recorded' jq -se --arg id "$session_uuid" \
+  '.[0].session_id == $id and .[0].session_title == "New name" and .[0].project == "/x/proj"' "$log"
+run codex 1 0 CLAUDE_CODE_SESSION_ID='../../etc' CLAUDE_CONFIG_DIR="$fake_claude"
+check 'invalid session id ignored' jq -se '.[0].session_id == null and .[0].session_title == null' "$log"
+check 'invalid session id run succeeds' test "$result" = 0
+run codex 1 0 CLAUDE_CODE_SESSION_ID="$session_uuid" CLAUDE_CONFIG_DIR="$tmp/no-such-claude"
+check 'missing transcript title null, project from workdir' jq -se --arg workdir "$tmp/work" \
+  '.[0].session_id != null and .[0].session_title == null and .[0].project == $workdir' "$log"
 
 run codex 1 0 ORCH_LABEL='custom label' ORCH_PARENT=parent-task
 check 'explicit label/parent' jq -se '.[0].label == "custom label" and .[0].parent == "parent-task"' "$log"

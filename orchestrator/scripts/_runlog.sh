@@ -84,6 +84,27 @@ _runlog_oversize() {
   _runlog_segment_bytes=$((_runlog_segment_bytes + ${#rec} + 1))
 }
 
+# Best effort: the launching Claude Code chat and its project, from a session-id read of the transcript.
+# Sets _runlog_session_id, _runlog_session_title, _runlog_project (empty string = unknown).
+# Never fails, never writes to stdout/stderr, safe under set -euo pipefail.
+_runlog_session() {
+  _runlog_session_id= _runlog_session_title= _runlog_project=
+  local id=${CLAUDE_CODE_SESSION_ID-} dir dirs=() t title cwd
+  if [[ ! $id =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then return 0; fi
+  _runlog_session_id=$id
+  dir=${CLAUDE_CONFIG_DIR:-${HOME:-}/.claude}/projects
+  { for t in "$dir"/*/"$id".jsonl; do [[ -f $t && ! -L $t ]] && dirs+=("$t") && break; done; } 2>/dev/null || true
+  t=${dirs[0]-}
+  if [[ -z $t ]]; then return 0; fi
+  # ponytail: the title is read once at start, so a chat renamed later keeps the old name in this run's record
+  # (upgrade path: the UI re-reads the transcript).
+  title=$({ grep -F '"type":"custom-title"' -- "$t" | tail -n 1 | jq -r '.customTitle // empty'; } 2>/dev/null) || title=
+  _runlog_session_title=${title:0:200}
+  cwd=$({ grep -m1 -F '"cwd":"' -- "$t" | jq -r '.cwd // empty'; } 2>/dev/null) || cwd=
+  if [[ $cwd == /* ]]; then _runlog_project=$cwd; fi
+  return 0
+}
+
 _runlog_init() {
   _runlog_initialized=1
   _runlog_executor=$1
@@ -110,12 +131,20 @@ _runlog_init() {
   _runlog_keep=${ORCH_RUNLOG_KEEP_SEGMENTS:-4}
   [[ $_runlog_keep =~ ^[1-9][0-9]*$ ]] || _runlog_keep=4
   workdir=$(cd -- "$3" 2>/dev/null && pwd) || workdir=$3
+  _runlog_session || true
+  # project falls back to the run's resolved workdir when the transcript cannot be read.
+  if [[ -z $_runlog_project ]]; then _runlog_project=$workdir; fi
   jq -nc --arg run_id "$_runlog_id" --arg executor "$1" --arg model "$4" \
     --arg label "${ORCH_LABEL-${2##*/}}" --arg parent "${ORCH_PARENT:-}" \
-    --arg workdir "$workdir" --argjson pid "$$" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" '
+    --arg workdir "$workdir" --argjson pid "$$" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
+    --arg session_id "$_runlog_session_id" --arg session_title "$_runlog_session_title" \
+    --arg project "$_runlog_project" '
     {v:1, type:"orchestrator.start", $run_id, $executor,
      model:($model | select(. != "") // null), label:($label | select(. != "") // null),
      parent:($parent | select(. != "") // null), $workdir, $pid,
+     session_id:($session_id | select(. != "") // null),
+     session_title:($session_title | select(. != "") // null),
+     project:($project | select(. != "") // null),
      granularity:(if $executor == "agy" then "final-only" else "live" end), $ts}' \
     | _runlog_append || true
 }
