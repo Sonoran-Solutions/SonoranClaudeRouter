@@ -25,7 +25,7 @@ Pane polls files with `$.fs` / `$.clock.every`, renders complete records, tolera
 
 **Gate:** Codex and Pi each show a real event *before exit*; agy is accurately marked final-only. Verify same final result and exit code with monitoring on/off, including when log writing fails.
 
-**Done:** [`orchestrator/`](../orchestrator/) + [`tests/wrappers.test.sh`](../tests/wrappers.test.sh); live Codex and Pi records observed seconds before exit; on/off identical. **Open:** agy live run (or accept as a documented limitation); installing into the live skill. Log layout is now a lifecycle file plus rotating segments (senior review P1).
+**Done:** [`orchestrator/`](../orchestrator/) + [`tests/wrappers.test.sh`](../tests/wrappers.test.sh); live Codex and Pi records observed seconds before exit; on/off identical. agy live run passed (final-only, on/off identical). **Open:** installing into the live skill. Log layout is now a lifecycle file plus rotating segments (senior review P1).
 
 ## 2. Claude attribution
 

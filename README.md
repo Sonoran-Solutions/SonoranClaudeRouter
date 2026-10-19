@@ -50,4 +50,4 @@ There is **no collector service, socket, browser viewer, persistent ingestion cu
 - [Mockup asset notes](docs/assets/README.md): committed image and interpretation.
 - [Run-log contract](docs/LOG_CONTRACT.md) and [evidence](docs/EVIDENCE.md).
 
-**Remaining before merge:** a person confirms the pane in the desktop app (phase 0 gate), agy is exercised live, and the owner decides whether to install the new wrappers. See [evidence](docs/EVIDENCE.md).
+**Remaining before merge:** a person confirms the pane updates and closes in the desktop app and shows concurrent workers separately, and the owner decides whether to install the new wrappers. See [evidence](docs/EVIDENCE.md).

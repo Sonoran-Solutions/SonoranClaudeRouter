@@ -59,8 +59,13 @@ per tool start/update/end (its per-token `message_update` records are dropped fr
 Monitoring on/off with real workers (`ls` task): Codex rc 0 / `done` both ways; Pi rc 0 / `done` and the same
 cost line both ways. Directory `0700`, files `0600`.
 
-**agy** was not run live: the session's permission classifier refused a direct `agy --dangerously-skip-permissions`
-call. Its wrapper is covered by the fake-worker suite only.
+**agy** (`run_agy.sh`, agy 1.4.2, `gemini-3.8-flash-low`, prompt "Reply with exactly: pong", empty scratch
+workdir; run on 2026-10-19 with the owner's explicit approval, since the wrapper uses `--dangerously-skip-permissions`):
+the lifecycle file appeared +0.2 s after launch with only `orchestrator.start` (`granularity: final-only`); after agy
+returned (~7 s) it held `orchestrator.final` (`status SUCCESS`, `response "pong\n"`, `response_truncated false`,
+`response_chars 5`) and `orchestrator.exit` (`exit_code 0`, `segments 0`); file mode `0600`, 757 bytes, no
+segments. With `ORCH_RUNLOG=0` the same call printed the same stdout (`pong`), the same empty stderr and rc 0. The
+workdir stayed empty.
 
 ## Observations and caveats
 
