@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, RenderPropsOf } from 'claude-code'
-import { paneBudget } from '../hooks/register'
+import { fitLines, paneBudget } from '../hooks/register'
 import type { PaneBudgetInput } from '../hooks/register'
 
 const NOW = Date.UTC(2026, 9, 19, 19, 32, 0)
@@ -67,10 +67,10 @@ function world(on: On): World {
   return w
 }
 
-const mount = ($: Engine, surface: (typeof SURFACES)[number], bodyRows = 40) =>
+const mount = ($: Engine, surface: (typeof SURFACES)[number], bodyRows = 40, bodyColumns = PANE.bodyColumns) =>
   $.ui.mount({
     plugin: 'agent-inspector', surface, component: 'Pane', requestId: 'agent-inspector',
-    props: { ...PANE, scroll: { offset: 0, bodyRows } }, viewport: { columns: 140, rows: 44 },
+    props: { ...PANE, bodyColumns, scroll: { offset: 0, bodyRows } }, viewport: { columns: 140, rows: 44 },
   })
 
 test('the pane shows remaining usage from session.usage and usage.sh on both surfaces', async ($, on) => {
@@ -417,4 +417,61 @@ test('closing the pane mid-refresh and reopening within 5 minutes shows the late
   expect((await ui.find({ type: 'Box', key: 'usage:openrouter' }))?.text).toMatch(/\$16\.31 left/)
   expect(await ui.find({ text: /updated \d\d:\d\d:\d\d/ })).toBeDefined()
   await ui.unmount()
+})
+
+test('fitLines cuts at newline and width boundaries, never past maxRows', () => {
+  const MARK = '… [x to expand]'
+  const tall = fitLines('line\n'.repeat(200), 70, 3)
+  expect(tall.lines.length).toBe(3)
+  expect(tall.isCut).toBe(true)
+  expect(tall.lines[2]!.endsWith(MARK)).toBe(true)
+  expect(tall.lines.every(one => one.length <= 70)).toBe(true)
+  const long = fitLines('x'.repeat(500), 70, 4)
+  expect(long.lines.length).toBe(4)
+  expect(long.isCut).toBe(true)
+  expect(long.lines.every(one => one.length <= 70)).toBe(true)
+  expect(fitLines('a\n\nb', 70, 3)).toEqual({ lines: ['a', '', 'b'], isCut: false })
+  expect(fitLines('x'.repeat(140), 70, 2).isCut).toBe(false)
+  expect(fitLines('anything', 70, 0)).toEqual({ lines: [], isCut: true })
+})
+
+test('a 12x70 pane keeps events plus both notice rows within the event room, with a tall newest event', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  const id = '20261019T171901000Z-codex-00000001'
+  const rec = (r: object) => `${JSON.stringify(r)}\n`
+  const msg = (text: string) => rec({ type: 'item.completed', item: { id: text, type: 'agent_message', text } })
+  w.files.set(`${id}.jsonl`, rec({
+    v: 1, type: 'orchestrator.start', run_id: id, executor: 'codex', model: 'gpt-5.5', label: 'task',
+    parent: null, workdir: '/tmp/w', pid: 4242, granularity: 'live', ts: '2026-10-19T17:19:00.000Z',
+  }))
+  // 210 older messages (over the 200 kept, so events.omitted > 0), the tall tool output, then 5 newer events.
+  w.files.set(`${id}.1.jsonl`, [
+    ...Array.from({ length: 210 }, (_, k) => msg(`old ${k}`)),
+    rec({ type: 'item.completed', item: { id: 't', type: 'command_execution', command: 'x', aggregated_output: 'line\n'.repeat(200), exit_code: 0, status: 'completed' } }),
+    ...Array.from({ length: 5 }, (_, k) => msg(`new ${k}`)),
+  ].join(''))
+  await $.session.start(BOOT)
+  await clock.advance(1000)
+
+  const budget = paneBudget({ rows: 12, width: 70, hasNotice: false, hasUsageError: false, groups: 1, ids: 1, selection: 'run' })
+  for (const surface of SURFACES) {
+    const ui = await mount($, surface, 12, 70)
+    await ui.press({ key: 'older' }) // follow off, 5 events back: the tall output is the newest shown, 5 are below
+    // The tree carries no Text keys, so the notices are found by text and each event Box `ev:<seq>`
+    // counts its children: one header Text plus one Text per pre-wrapped line (`evline:<seq>:<n>`).
+    const older = await ui.find({ type: 'Text', text: /more above/ })
+    expect(older?.text).toMatch(/^\d+ more above \(u to scroll\) · 17 older events omitted/)
+    expect(await ui.find({ type: 'Text', text: /^5 newer events below \(f to follow\)$/ })).toBeDefined()
+    const boxes = (await ui.findAll({ type: 'Box' })).filter(one => /^ev:\d+$/.test(one.key ?? ''))
+    const rows = boxes.flatMap(one => one.children ?? [])
+    expect(boxes.length).toBeGreaterThanOrEqual(1)
+    expect(rows.length).toBeGreaterThan(boxes.length) // header rows plus at least one text row
+    expect(rows.length + 2).toBeLessThanOrEqual(budget.eventRoom)
+    const last = boxes[boxes.length - 1]!
+    expect(last.text.endsWith('… [x to expand]')).toBe(true)
+    for (const text of (last.children ?? []).slice(1)) expect(JSON.stringify(text).length).toBeLessThan(120)
+    await ui.press({ key: 'follow' })
+    await ui.unmount()
+  }
 })

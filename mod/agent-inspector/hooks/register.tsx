@@ -899,6 +899,33 @@ const KIND_COLOR: Record<string, string> = {
   other: 'inactive',
 }
 
+/**
+ * Hard-wraps `text` into lines of at most `width` characters (newlines
+ * respected, an empty line is one empty chunk) and keeps the first `maxRows`.
+ * When anything is left out the last line ends with CUT_MARKER, still within
+ * `width`.
+ */
+export function fitLines(text: string, width: number, maxRows: number): { lines: string[]; isCut: boolean } {
+  const w = Math.max(1, width)
+  const lines: string[] = []
+  let isCut = false
+  outer: for (const line of text.split('\n')) {
+    const chunks = Math.max(1, Math.ceil(line.length / w))
+    for (let i = 0; i < chunks; i++) {
+      if (lines.length >= maxRows) {
+        isCut = true
+        break outer
+      }
+      lines.push(line.slice(i * w, (i + 1) * w))
+    }
+  }
+  if (isCut && lines.length > 0) {
+    const last = lines.length - 1
+    lines[last] = `${lines[last]!.slice(0, Math.max(0, w - CUT_MARKER.length)).trimEnd()}${CUT_MARKER}`.slice(0, w)
+  }
+  return { lines, isCut }
+}
+
 function eventList(
   Text: TextC,
   Box: BoxC,
@@ -908,54 +935,55 @@ function eventList(
   width: number,
   segmentsOmitted: number,
 ): RenderElement {
-  const room = budget.eventRoom
-  // Leave the last row for the "more above" marker; below two rows nothing fits.
-  const lines = Math.max(0, room - 1)
+  const isCompact = budget.isCompact
+  const wrap = isCompact ? ('truncate-end' as const) : undefined
   const items = events.items
   const lost =
     segmentsOmitted > 0
       ? `events of ${segmentsOmitted} log segment${segmentsOmitted === 1 ? '' : 's'} omitted (rotated away or over the read limit; not counted)`
       : ''
-  if (items.length === 0) return <Text dimColor>{lost || 'No events yet.'}</Text>
+  if (items.length === 0) return <Text dimColor wrap={wrap}>{lost || 'No events yet.'}</Text>
   const end =
     view.anchorSeq === null
       ? items.length
       : Math.max(1, items.findIndex(one => one.seq > view.anchorSeq!) === -1 ? items.length : items.findIndex(one => one.seq > view.anchorSeq!))
+  const below = items.length - end
   const limit = view.isExpanded ? MAX_STORED_CHARS : SHOWN_CHARS
+  // One row for the "older" notices (when there may be any) and one for the
+  // "below" line come off the room before the events are fitted.
+  const hasOlderRow = end > 1 || events.omitted > 0 || segmentsOmitted > 0
+  let left = budget.eventRoom - (hasOlderRow ? 1 : 0) - (below > 0 ? 1 : 0)
   // The first (newest) event must fit too: if it does not, its text is cut so the
-  // header and the text fit in room - 1 rows, the last row staying for the "more
-  // above" marker. One that does not fit even then is dropped with a note.
+  // header and the text fit in the rows left. One that does not fit even then is
+  // dropped (the "more above" note says so). Compact events are drawn as the
+  // pre-wrapped lines counted here, so rendered rows equal counted rows.
   const fitted: DisplayEvent[] = []
-  const shownLines = new Map<number, string>()
-  let left = lines
+  const shownLines = new Map<number, string[]>()
   for (let i = end - 1; i >= 0; i--) {
     const one = items[i]!
     const text = shownText(one, limit)
-    const cost = 1 + lineCount(text, width)
-    if (fitted.length === 0 && cost > left) {
-      // The newest event is taller than the room: keep its header and the
-      // longest prefix, marker included, that fits in the rows left.
-      if (left >= 2) {
-        const keep = Math.min(text.length - CUT_MARKER.length, (left - 1) * width - CUT_MARKER.length)
+    const all = fitLines(text, width, Infinity).lines
+    const cost = 1 + all.length
+    if (cost > left) {
+      if (fitted.length === 0 && left >= 2) {
         fitted.unshift(one)
-        shownLines.set(one.seq, `${text.slice(0, keep).trimEnd()}${CUT_MARKER}`)
+        shownLines.set(one.seq, fitLines(text, width, left - 1).lines)
       }
       break
     }
-    if (fitted.length > 0 && cost > left) break
     fitted.unshift(one)
+    if (isCompact) shownLines.set(one.seq, all)
     left -= cost
   }
   const above = end - fitted.length
-  const below = items.length - end
   const older = [
-    lost,
-    events.omitted > 0 ? `${events.omitted} older event${events.omitted === 1 ? '' : 's'} omitted (only the newest ${items.length} are kept)` : '',
     above > 0 ? `${above} more above (u to scroll)` : '',
+    events.omitted > 0 ? `${events.omitted} older event${events.omitted === 1 ? '' : 's'} omitted (only the newest ${items.length} are kept)` : '',
+    lost,
   ].filter(Boolean)
   return (
     <Box flexDirection="column">
-      {older.length > 0 && <Text dimColor>{older.join(' · ')}</Text>}
+      {older.length > 0 && <Text key="ev:older" dimColor wrap={wrap}>{older.join(' · ')}</Text>}
       {fitted.map(one => (
         <Box key={`ev:${one.seq}`} flexDirection="column">
           <Text wrap="truncate-end">
@@ -965,10 +993,16 @@ function eventList(
             </Text>
             {one.role !== undefined ? <Text dimColor> ({one.role})</Text> : ''}
           </Text>
-          <Text>{shownLines.get(one.seq) ?? shownText(one, limit)}</Text>
+          {isCompact ? (
+            shownLines.get(one.seq)!.map((text, n) => (
+              <Text key={`evline:${one.seq}:${n}`} wrap="truncate-end">{text}</Text>
+            ))
+          ) : (
+            <Text>{shownLines.get(one.seq)?.join('\n') ?? shownText(one, limit)}</Text>
+          )}
         </Box>
       ))}
-      {below > 0 && <Text dimColor>{below} newer event{below === 1 ? '' : 's'} below (f to follow)</Text>}
+      {below > 0 && <Text key="ev:below" dimColor wrap={wrap}>{below} newer event{below === 1 ? '' : 's'} below (f to follow)</Text>}
     </Box>
   )
 }
@@ -976,10 +1010,6 @@ function eventList(
 function shownText(one: DisplayEvent, limit: number): string {
   if (one.text.length <= limit) return one.text
   return `${one.text.slice(0, limit)}… [${one.text.length - limit} more; x to expand]`
-}
-
-function lineCount(text: string, width: number): number {
-  return text.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(line.length / width)), 0)
 }
 
 /** Four one-line fields (truncated when the pane is compact), so four rows at most. */
