@@ -59,6 +59,8 @@ const QUIET_MS = 30_000
 // with another skills dir or a different cadence edits these two constants;
 // upgrade path is a userConfig field (plugin.json) read with $.settings.
 const USAGE_REFRESH_MS = 5 * 60_000
+/** Below this many body rows the Usage section is a single line. */
+const COMPACT_BELOW_ROWS = 24
 const USAGE_SCRIPT = '.claude/skills/orchestrator/scripts/usage.sh' // under $HOME
 
 const RUNS = atom({ plugin: 'agent-inspector', key: 'runs' } as const, [])
@@ -129,9 +131,20 @@ const time = (v: unknown): number | null => {
   const t = typeof v === 'string' ? Date.parse(v) : NaN
   return Number.isFinite(t) ? t : null
 }
-const win = (label: string, used: unknown, resets?: unknown): UsageWindow[] => {
+const win = (label: string, used: unknown, resets?: unknown, scope?: string): UsageWindow[] => {
   const usedPct = num(used)
-  return usedPct === null ? [] : [{ label, usedPct, resetsAt: time(resets) }]
+  return usedPct === null ? [] : [{ label, usedPct, resetsAt: time(resets), ...(scope === undefined ? {} : { scope }) }]
+}
+
+/** One agy window per group from its tighter (larger) of 5h and week. */
+function groupWin(label: string, g: Record<string, unknown>): UsageWindow[] {
+  const fiveHour = num(g.five_hour_used_pct)
+  const weekly = num(g.weekly_used_pct)
+  if (fiveHour === null && weekly === null) return []
+  const isFiveHour = fiveHour !== null && (weekly === null || fiveHour > weekly)
+  return isFiveHour
+    ? [{ label, usedPct: fiveHour, resetsAt: null, scope: '5h' }]
+    : [{ label, usedPct: weekly as number, resetsAt: time(g.weekly_resets_at), scope: 'week' }]
 }
 
 function row(p: Record<string, unknown>, windows: UsageWindow[]): UsageRow {
@@ -150,13 +163,16 @@ function parseUsage(stdout: string): ScriptUsage {
     throw new Error('usage.sh printed no JSON')
   }
   const root = obj(json)
+  const isSection = (v: unknown): boolean => typeof obj(v).status === 'string'
+  // Valid JSON with no provider sections at all is not a snapshot: keep the last good one.
+  if (![root.codex, root.google, root.openrouter].some(isSection)) throw new Error('usage.sh printed malformed JSON (no provider sections)')
   const codex = obj(root.codex)
   const hours = num(codex.window_h)
   const label = hours === 168 ? 'week' : hours === 5 ? '5h' : hours === null ? 'window' : `${hours}h`
   const agy = obj(root.google)
   const groups: [string, string][] = [['gemini', 'gemini'], ['claude/gpt', 'claude_gpt'], ['argon', 'argon']]
-  let agyWindows = groups.flatMap(([name, key]) => win(name, obj(agy[key]).weekly_used_pct, obj(agy[key]).weekly_resets_at))
-  if (agyWindows.length === 0) agyWindows = win('overall', agy.used_pct)
+  let agyWindows = groups.flatMap(([name, key]) => groupWin(name, obj(agy[key])))
+  if (agyWindows.length === 0) agyWindows = win('agy', agy.used_pct, undefined, 'overall')
   const or = obj(root.openrouter)
   const remaining = num(or.credits_remaining_usd)
   return {
@@ -484,8 +500,6 @@ export const register: Register = on => {
     const selected = currentSelection(view, ids)
     const width = Math.max(24, e.props.bodyColumns)
     const rows = Math.max(12, e.props.scroll.bodyRows)
-    let used = 0
-
     const header = (
       <Box flexDirection="row" justifyContent="space-between">
         <Text bold>
@@ -494,27 +508,34 @@ export const register: Register = on => {
         {status.polledAt !== null && <Text dimColor>polled {clockTime(status.polledAt)}</Text>}
       </Box>
     )
-    used += 1
 
     const notice = dirNotice(status)
-    if (notice !== null) used += 1
 
-    // Usage: a header line, four provider rows, and the last failure if any.
-    used += 5 + (usage.error !== null ? 1 : 0)
+    // Short panes: Usage collapses to one line so the event list keeps its room.
+    const isCompact = rows < COMPACT_BELOW_ROWS
+    const refresh = (
+      <Button key="refresh" plain hotkey="r" label={usage.isRefreshing ? 'refreshing…' : isCompact ? 'r' : 'r refresh'} onPress={() => refreshNow($)} />
+    )
     const usageHeader = (
       <Box flexDirection="row" columnGap={1}>
         <Text bold>Usage</Text>
         <Text dimColor>
           · {usage.updatedAt === null ? 'not loaded yet' : `updated ${clockTime(usage.updatedAt)} (${span(now - usage.updatedAt)} ago)`}
         </Text>
-        <Button key="refresh" plain hotkey="r" label={usage.isRefreshing ? 'refreshing…' : 'r refresh'} onPress={() => refreshNow($)} />
+        {refresh}
       </Box>
     )
 
-    // Worker list: a window around the selection, at most a third of the room.
-    const listRoom = Math.max(3, Math.floor(rows / 3))
+    // Fixed rows first (header, notice, usage, separator, controls, run detail
+    // summary); the worker list and the event list share what is left, the
+    // event list keeping at least 3 rows and the list at least the selection.
+    const hasError = usage.error !== null
+    const groups = (runs.length > 0 ? 1 : 0) + (claude.length > 0 ? 1 : 0)
+    const fixed =
+      1 + (notice !== null ? 1 : 0) + (isCompact ? 1 : 5 + (hasError ? 1 : 0)) + 1 + (width < 70 ? 2 : 1) + (selected === null ? 1 : 4)
+    const listRoom = Math.max(1, Math.min(Math.max(3, Math.floor(rows / 3)), rows - fixed - 3 - groups))
     const window = listWindow(ids, selected, listRoom)
-    used += window.length + (runs.length > 0 ? 1 : 0) + (claude.length > 0 ? 1 : 0) + 1
+    const used = fixed + window.length + groups
     const runRows = runs.filter(run => window.includes(run.id))
     const claudeRows = claude.filter(agent => window.includes(`claude:${agent.id}`))
 
@@ -540,7 +561,6 @@ export const register: Register = on => {
         />
       </Box>
     )
-    used += width < 70 ? 2 : 1
 
     let detail: RenderElement | null = null
     if (selected === null) {
@@ -552,7 +572,6 @@ export const register: Register = on => {
       const run = runs.find(one => one.id === selected)!
       const events = await readEvents($, run.id)
       const summary = runDetail(Text, Box, run, now)
-      used += 4
       detail = (
         <Box flexDirection="column">
           {summary}
@@ -565,9 +584,9 @@ export const register: Register = on => {
       <Box flexDirection="column" width={width}>
         {header}
         {notice !== null && <Text color="warning">{notice}</Text>}
-        {usageHeader}
-        {usage.error !== null && <Text color="error">usage.sh: {usage.error} (showing the last good figures)</Text>}
-        {usageRows(Text, Box, usage, now)}
+        {isCompact ? compactUsage(Text, Box, usage, refresh) : usageHeader}
+        {!isCompact && hasError && <Text color="error">usage.sh: {usage.error} (showing the last good figures)</Text>}
+        {!isCompact && usageRows(Text, Box, usage, now)}
         {runRows.length > 0 && <Text dimColor>External workers</Text>}
         {runRows.map(run => (
           <Box key={`row:${run.id}`} flexDirection="row" columnGap={1}>
@@ -639,7 +658,7 @@ function usageRow(Text: TextC, Box: BoxC, name: string, key: string, body: Rende
   )
 }
 
-/** Remaining, not used. `compact` (agy): "gemini 60% · argon 100% left (week)", no resets. */
+/** Remaining, not used. `compact` (agy): "gemini 60% (week) · argon 100% (week) left", no resets. */
 function windowsBody(Text: TextC, windows: readonly UsageWindow[], now: number, compact: boolean): RenderElement | null {
   if (windows.length === 0) return null
   return (
@@ -648,12 +667,52 @@ function windowsBody(Text: TextC, windows: readonly UsageWindow[], now: number, 
         <Text key={w.label}>
           {i > 0 ? ' · ' : ''}
           {w.label} <Text color={usageColor(w.usedPct)}>{Math.max(0, Math.round(100 - w.usedPct))}%</Text>
-          {compact ? '' : ' left'}
+          {compact ? (w.scope !== undefined ? ` (${w.scope})` : '') : ' left'}
           {!compact && w.resetsAt !== null ? <Text dimColor> (resets {span(w.resetsAt - now)})</Text> : ''}
         </Text>
       ))}
-      {compact ? ' left (week)' : ''}
+      {compact ? ' left' : ''}
     </Text>
+  )
+}
+
+/** Tightest window of a provider: the one with the least left. */
+const tightest = (windows: readonly UsageWindow[]): UsageWindow | undefined => windows.reduce<UsageWindow | undefined>((a, w) => (a === undefined || w.usedPct > a.usedPct ? w : a), undefined)
+
+/** One line: "Usage · Claude 49% · Codex 69% · agy 0% (5h) · OR $16.31 · r" (remaining; ? when unknown). */
+function compactUsage(Text: TextC, Box: BoxC, usage: UsageState, refresh: RenderElement): RenderElement {
+  const s = usage.script
+  const pct = (name: string, windows: readonly UsageWindow[], withScope = false): RenderElement => {
+    const w = tightest(windows)
+    if (w === undefined) return <Text dimColor>{name} ?</Text>
+    return (
+      <Text>
+        {name} <Text color={usageColor(w.usedPct)}>{Math.max(0, Math.round(100 - w.usedPct))}%</Text>
+        {withScope && w.scope !== undefined ? ` (${w.scope})` : ''}
+      </Text>
+    )
+  }
+  const credits = s?.openrouter.credits ?? null
+  return (
+    <Box key="usage:compact" flexDirection="row" flexWrap="wrap" columnGap={1}>
+      <Text bold>Usage</Text>
+      <Text dimColor>·</Text>
+      {pct('Claude', usage.claude)}
+      <Text dimColor>·</Text>
+      {pct('Codex', s?.codex.windows ?? [])}
+      <Text dimColor>·</Text>
+      {pct('agy', s?.agy.windows ?? [], true)}
+      <Text dimColor>·</Text>
+      {credits === null ? (
+        <Text dimColor>OR ?</Text>
+      ) : (
+        <Text>
+          OR <Text color={usageColor(null, credits.remainingUsd)}>${credits.remainingUsd.toFixed(2)}</Text>
+        </Text>
+      )}
+      {usage.error !== null && <Text dimColor>· error</Text>}
+      {refresh}
+    </Box>
   )
 }
 

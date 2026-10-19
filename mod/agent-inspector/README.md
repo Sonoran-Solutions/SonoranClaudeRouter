@@ -50,6 +50,11 @@ Checks: `claude plugin validate mod/agent-inspector` and `claude plugin test mod
   5 minutes while it stays placed, and on `r`; never while the pane is closed. The cadence and the script path
   (`$HOME/.claude/skills/orchestrator/scripts/usage.sh`) are constants in `hooks/register.tsx`. A failed run (non-zero
   exit, 3-minute timeout, unreadable output) shows an error line and keeps the last good figures with their age.
+  A refresh already started finishes (up to the 180 s timeout) even if the pane is closed; its result is kept and
+  no new one starts while the pane is closed. `usage.sh` only reads: codex `app-server` `account/rateLimits/read`,
+  `agy -p /quota` and `/credits` (slash commands; the script requires `num_turns` 0 and zero tokens) and two
+  OpenRouter GET endpoints. No model completions, and no writes beyond those CLIs' own logs.
+  On short panes (under 24 body rows) Usage collapses to one line with each provider's tightest remaining figure.
   Claude's figures come from the session's rate-limit windows: they are empty off a subscription, and before the
   first API response of a session. Only display fields are kept in state (no key sources, no raw output).
 - **Polling.** A 1 s timer runs for the session, but while the pane is not placed each tick is a single

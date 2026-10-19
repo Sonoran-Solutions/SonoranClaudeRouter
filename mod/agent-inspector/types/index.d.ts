@@ -108,6 +108,8 @@ export type UsageWindow = {
   usedPct: number
   /** ms since the epoch. */
   resetsAt: number | null
+  /** Which window a compact row's figure comes from: '5h', 'week' or 'overall'. */
+  scope?: string
 }
 
 /** Windows when the provider answered; else `note` says why not. */

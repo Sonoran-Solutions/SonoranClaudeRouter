@@ -23,13 +23,25 @@ const BOOT = { cwd: '/tmp', surface: 'terminal', isInteractive: true } as const
 const SURFACES = ['terminal', 'desktop'] as const
 
 type Run = { argv: readonly string[]; timeoutMs?: number }
-type World = { isOpen: boolean; runs: Run[]; stdout: string; fail: string | null }
+type World = {
+  isOpen: boolean; runs: Run[]; stdout: string; fail: string | null
+  files: Map<string, string> // run-log files under DIR (name -> text)
+  gate: Promise<void> | null // when set, process.run waits for it
+}
+const DIR = '/run/user/1000/orchestrator'
 
 function world(on: On): World {
-  const w: World = { isOpen: true, runs: [], stdout: SNAPSHOT, fail: null }
+  const w: World = { isOpen: true, runs: [], stdout: SNAPSHOT, fail: null, files: new Map(), gate: null }
   mock.env(on, { HOME: '/home/dq', XDG_RUNTIME_DIR: '/run/user/1000' })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('fs.list', () => ({ value: [] }))
+  on('fs.list', () => ({
+    value: [...w.files].map(([name, text]) => ({ name, kind: 'file' as const, size: text.length, mtimeMs: 1, isLink: false })),
+  }))
+  on('fs.read', ($, e) => {
+    const text = w.files.get(e.path.slice(DIR.length + 1))
+    return text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: text }
+  })
+  on('fs.exists', () => ({ value: true }))
   on('agent.list', () => ({ value: [] }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('ui.panes', () => ({
@@ -44,16 +56,20 @@ function world(on: On): World {
       ],
     },
   }))
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
     w.runs.push({ argv: e.argv, timeoutMs: e.init?.timeoutMs })
+    if (w.gate !== null) await w.gate
     if (w.fail !== null) return { deny: w.fail }
     return { value: { exitCode: 0, stdout: w.stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   return w
 }
 
-const mount = ($: Engine, surface: (typeof SURFACES)[number]) =>
-  $.ui.mount({ plugin: 'agent-inspector', surface, component: 'Pane', requestId: 'agent-inspector', props: PANE, viewport: { columns: 140, rows: 44 } })
+const mount = ($: Engine, surface: (typeof SURFACES)[number], bodyRows = 40) =>
+  $.ui.mount({
+    plugin: 'agent-inspector', surface, component: 'Pane', requestId: 'agent-inspector',
+    props: { ...PANE, scroll: { offset: 0, bodyRows } }, viewport: { columns: 140, rows: 44 },
+  })
 
 test('the pane shows remaining usage from session.usage and usage.sh on both surfaces', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
@@ -88,7 +104,57 @@ test('agy figures show as remaining per group', async ($, on) => {
   await clock.advance(1000)
   for (const surface of SURFACES) {
     const ui = await mount($, surface)
-    expect((await ui.find({ type: 'Box', key: 'usage:agy' }))?.text).toMatch(/gemini 60% · claude\/gpt 80% · argon 100% left \(week\)/)
+    expect((await ui.find({ type: 'Box', key: 'usage:agy' }))?.text).toMatch(/gemini 60% \(week\) · claude\/gpt 80% \(week\) · argon 100% \(week\) left/)
+    await ui.unmount()
+  }
+})
+
+test('agy shows the tighter of the 5h and week windows per group', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  const snap = JSON.parse(SNAPSHOT)
+  snap.google = {
+    status: 'ok', used_pct: 40, note: '',
+    gemini: { weekly_used_pct: 40, five_hour_used_pct: 100, weekly_resets_at: '2026-10-24T00:00:00Z' },
+  }
+  w.stdout = JSON.stringify(snap)
+  await $.session.start(BOOT)
+  await clock.advance(1000)
+  for (const surface of SURFACES) {
+    const ui = await mount($, surface)
+    expect((await ui.find({ type: 'Box', key: 'usage:agy' }))?.text).toMatch(/gemini 0% \(5h\)/)
+    await ui.unmount()
+  }
+})
+
+test('agy with no groups falls back to the overall figure', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  const snap = JSON.parse(SNAPSHOT)
+  snap.google = { status: 'ok', used_pct: 30, note: '' }
+  w.stdout = JSON.stringify(snap)
+  await $.session.start(BOOT)
+  await clock.advance(1000)
+  for (const surface of SURFACES) {
+    const ui = await mount($, surface)
+    const text = (await ui.find({ type: 'Box', key: 'usage:agy' }))?.text ?? ''
+    expect(text).toMatch(/agy 70% \(overall\) left/)
+    expect(text).not.toMatch(/week/)
+    await ui.unmount()
+  }
+})
+
+test('schema-invalid usage.sh JSON shows an error and keeps the last good figures', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  await $.session.start(BOOT)
+  await clock.advance(1000)
+  for (const bad of ['{}', 'null', '42']) {
+    w.stdout = bad
+    await clock.advance(5 * 60_000)
+    const ui = await mount($, 'terminal')
+    expect(await ui.find({ text: /malformed JSON/ })).toBeDefined()
+    expect((await ui.find({ type: 'Box', key: 'usage:openrouter' }))?.text).toMatch(/\$16\.31 left/)
     await ui.unmount()
   }
 })
@@ -137,5 +203,118 @@ test('a failing usage.sh shows an error, keeps the last good figures, and does n
   const ui = await mount($, 'terminal')
   expect(await ui.find({ text: /usage\.sh: usage\.sh printed no JSON/ })).toBeDefined()
   expect((await ui.find({ type: 'Box', key: 'usage:openrouter' }))?.text).toMatch(/\$16\.31 left/)
+  await ui.unmount()
+})
+
+// Five running workers; the newest (5) is selected. Each has a lifecycle start and six messages.
+function addRuns(w: World): void {
+  for (let i = 1; i <= 5; i++) {
+    const id = `20261019T1719${String(i).padStart(2, '0')}000Z-codex-0000000${i}`
+    const rec = (r: object) => `${JSON.stringify(r)}\n`
+    w.files.set(`${id}.jsonl`, rec({
+      v: 1, type: 'orchestrator.start', run_id: id, executor: 'codex', model: 'gpt-5.5', label: `task-${i}`,
+      parent: null, workdir: '/tmp/w', pid: 4242, granularity: 'live', ts: '2026-10-19T17:19:00.000Z',
+    }))
+    w.files.set(`${id}.1.jsonl`, [1, 2, 3, 4, 5, 6].map(k => rec({ type: 'item.completed', item: { id: `${i}-${k}`, type: 'agent_message', text: `msg ${i}-${k}` } })).join(''))
+  }
+}
+
+test('short panes: Usage is one compact line, the refresh button stays, and the selected worker keeps its events', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  addRuns(w)
+  const snap = JSON.parse(SNAPSHOT)
+  snap.google = { status: 'ok', used_pct: 40, note: '', gemini: { weekly_used_pct: 40, five_hour_used_pct: 100, weekly_resets_at: '2026-10-24T00:00:00Z' } }
+  w.stdout = JSON.stringify(snap)
+  await $.session.start(BOOT)
+  await clock.advance(1000)
+
+  for (const surface of SURFACES) {
+    for (const bodyRows of [12, 20]) {
+      const ui = await mount($, surface, bodyRows)
+      expect((await ui.find({ type: 'Box', key: 'usage:compact' }))?.text).toMatch(/Usage.*Claude 49%.*Codex 69%.*agy 0% \(5h\).*OR \$16\.31/)
+      expect(await ui.find({ type: 'Box', key: 'usage:claude' })).toBeUndefined()
+      expect(await ui.find({ type: 'Button', key: 'refresh' })).toBeDefined()
+      // Workers (5) and their events both fit: the selected worker's newest event is shown.
+      expect(await ui.find({ type: 'Box', key: `row:20261019T171905000Z-codex-00000005` })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /^msg 5-\d$/ })).toBeDefined()
+      await ui.unmount()
+    }
+    const tall = await mount($, surface, 40)
+    expect(await tall.find({ type: 'Box', key: 'usage:compact' })).toBeUndefined()
+    expect(await tall.find({ type: 'Box', key: 'usage:claude' })).toBeDefined()
+    expect(await tall.find({ type: 'Box', key: 'usage:openrouter' })).toBeDefined()
+    expect(await tall.find({ type: 'Button', key: 'refresh' })).toBeDefined()
+    expect(await tall.find({ type: 'Text', text: /^msg 5-\d$/ })).toBeDefined()
+    await tall.unmount()
+  }
+
+  // A failing run only adds a short marker to the compact line.
+  w.fail = 'boom'
+  await clock.advance(5 * 60_000)
+  const ui = await mount($, 'terminal', 12)
+  expect((await ui.find({ type: 'Box', key: 'usage:compact' }))?.text).toMatch(/· error/)
+  expect(await ui.find({ text: /usage\.sh: / })).toBeUndefined()
+  await ui.unmount()
+})
+
+/** A process.run that stays pending until `release()`. */
+function hold(w: World): () => void {
+  let release!: () => void
+  w.gate = new Promise<void>(resolve => (release = resolve))
+  return release
+}
+
+test('closing the pane mid-refresh: the run finishes quietly, nothing restarts, reopening past 5 minutes runs once more', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  const release = hold(w)
+  await $.session.start(BOOT)
+  await clock.advance(1000)
+  expect(w.runs.length).toBe(1)
+  const open = await mount($, 'terminal')
+  expect(await open.find({ type: 'Button', text: /refreshing…/ })).toBeDefined()
+  await open.unmount()
+
+  w.isOpen = false
+  await clock.advance(10 * 60_000)
+  expect(w.runs.length).toBe(1) // closed pane: no new run, and the pending one is not duplicated
+
+  release()
+  await clock.advance(1000)
+  const closed = await mount($, 'terminal')
+  expect(await closed.find({ text: /refreshing…/ })).toBeUndefined()
+  expect((await closed.find({ type: 'Box', key: 'usage:openrouter' }))?.text).toMatch(/\$16\.31 left/)
+  expect(await closed.find({ text: /usage\.sh: / })).toBeUndefined()
+  await closed.unmount()
+  expect(w.runs.length).toBe(1)
+
+  // The attempt began 10+ minutes ago (the 5-minute rule counts from the start), so reopening runs it once.
+  w.isOpen = true
+  await clock.advance(1000)
+  expect(w.runs.length).toBe(2)
+  await clock.advance(1000)
+  expect(w.runs.length).toBe(2)
+})
+
+test('closing the pane mid-refresh and reopening within 5 minutes shows the late figures without a new run', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  const release = hold(w)
+  await $.session.start(BOOT)
+  await clock.advance(1000)
+  expect(w.runs.length).toBe(1)
+
+  w.isOpen = false
+  await clock.advance(2 * 60_000)
+  release()
+  await clock.advance(1000)
+  w.isOpen = true
+  await clock.advance(2000)
+  expect(w.runs.length).toBe(1)
+  const ui = await mount($, 'desktop')
+  expect(await ui.find({ text: /refreshing…/ })).toBeUndefined()
+  expect((await ui.find({ type: 'Box', key: 'usage:openrouter' }))?.text).toMatch(/\$16\.31 left/)
+  expect(await ui.find({ text: /updated \d\d:\d\d:\d\d/ })).toBeDefined()
   await ui.unmount()
 })
