@@ -46,6 +46,11 @@ elif [[ -n ${FAKE_BIGLINE:-} ]]; then
   jq -nc --arg pad "$(head -c "$FAKE_BIGLINE" /dev/zero | tr '\0' 'x')" '{type:"test.big", $pad}'
 elif [[ -n ${FAKE_GARBAGE:-} ]]; then
   printf 'not JSON\n'
+elif [[ -n ${FAKE_AGY_BIG:-} ]]; then
+  # agy final envelope with a FAKE_AGY_BIG-character response; a secret straddles character 65536.
+  # (stdin, not --arg: one argument is limited to 128 KiB)
+  head -c $((FAKE_AGY_BIG - 70)) /dev/zero | tr '\0' 'a' | jq -Rsc --arg secret "$FAKE_SECRET" \
+    '{status:"SUCCESS", response:(. + " " + $secret + " " + ("z" * 38))}'
 else
   case $provider in
     codex) fixture=codex-exec.jsonl ;;
@@ -223,6 +228,22 @@ check 'pi provider records are in segment 1' test -s "$live/orchestrator/${live_
 
 run agy 1 0
 check 'agy final status/response' jq -se 'any(.[]; .type == "orchestrator.final" and .status == "SUCCESS" and .response == "done" and .parse_error == false)' "$log"
+# agy final response larger than the pane's 4 MiB read limit: stdout keeps all of it, the lifecycle file
+# keeps a capped copy, and the exit record stays readable.
+run agy 0 0 FAKE_AGY_BIG=5000000
+baseline
+run agy 1 0 FAKE_AGY_BIG=5000000
+check 'agy big response stdout/stderr/status unchanged' same_as
+check 'agy big response stdout is complete' test "$(wc -c < "$stdout")" -ge 5000000
+check 'agy big response lifecycle under 512 KiB' test "$(wc -c < "$log")" -lt 524288
+check 'agy big response exit record visible' jq -se 'last | .type == "orchestrator.exit" and .exit_code == 0' "$log"
+check 'agy big response truncation recorded' jq -se \
+  'any(.[]; .type == "orchestrator.final" and .response_truncated == true and .response_chars > 4900000 and (.response | length) == 65536)' "$log"
+check 'agy big response secret never logged, even cut' bash -c '! grep -q "sk-or" "$1"' _ "$log"
+run agy 1 0 FAKE_AGY_BIG=5000000 ORCH_RUNLOG_FINAL_MAX_CHARS=1000
+check 'agy final cap configurable' jq -se 'any(.[]; .type == "orchestrator.final" and (.response | length) == 1000)' "$log"
+run agy 1 0
+check 'agy small response flags' jq -se 'any(.[]; .type == "orchestrator.final" and .response_truncated == false and .response_chars == 4)' "$log"
 run agy 0 0 FAKE_GARBAGE=1
 baseline
 run agy 1 0 FAKE_GARBAGE=1

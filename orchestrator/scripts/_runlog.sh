@@ -148,11 +148,24 @@ _runlog_exit() {
   fi
   [[ -n $_runlog_file ]] || return 0
   if [[ $_runlog_executor == agy && ${res+x} ]]; then
+    # The lifecycle file must stay small enough for the pane to read, so the logged response is capped
+    # (redacted first, so a secret is never cut into an unredactable fragment). The caller's stdout is not.
+    local max=${ORCH_RUNLOG_FINAL_MAX_CHARS:-65536}
+    [[ $max =~ ^[1-9][0-9]*$ ]] || max=65536
     printf '%s' "$res" | jq -Rsc --arg run_id "$_runlog_id" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" '
       (try {value:fromjson, parse_error:false} catch {value:null, parse_error:true}) as $parsed
       | {v:1, type:"orchestrator.final", $run_id, $ts,
          status:($parsed.value | .status? // null), response:($parsed.value | .response? // null),
-         parse_error:$parsed.parse_error}' | _runlog_append || true
+         parse_error:$parsed.parse_error}' 2>/dev/null \
+      | ORCH_RUNLOG_KEY=${OPENROUTER_API_KEY:-} jq -c "$_runlog_redact" 2>/dev/null \
+      | jq -c --argjson max "$max" '
+          (.response | if . == null then null elif type == "string" then . else tojson end) as $r
+          | (.status | if . == null then null else tostring | .[:200] end) as $status
+          | .status = $status
+          | .response = (if $r == null then null else $r[:$max] end)
+          | .response_truncated = ($r != null and ($r | length) > $max)
+          | .response_chars = (if $r == null then null else ($r | length) end)' 2>/dev/null \
+      | _runlog_append || true
   fi
   # Highest segment number that exists now (older ones may have been rotated away), or the
   # highest the logger ever wrote if they are all gone.

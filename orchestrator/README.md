@@ -61,6 +61,7 @@ Codex) stay in place.
 | `ORCH_RUNLOG_RETENTION_MIN` | `1440` | logs older than this are deleted at the next launch |
 | `ORCH_RUNLOG_SEGMENT_BYTES` | `1048576` | provider records rotate to a new `<run-id>.<n>.jsonl` segment at this size |
 | `ORCH_RUNLOG_KEEP_SEGMENTS` | `4` | older segments of a run are deleted after a rotation |
+| `ORCH_RUNLOG_FINAL_MAX_CHARS` | `65536` | agy's final response is cut to this many characters in the log (stdout keeps all of it) |
 
 ## Tests
 
