@@ -1,42 +1,38 @@
-# Agent Inspector: small implementation plan
+# Agent Inspector: implementation plan
 
 Date: 2026-10-19  
-Status: proposed tasks, not implementation authorization. No phases have started.
+**Status: proposal only; no implementation authorized.** The existing router is at `~/.claude/skills/orchestrator`. The [owner-machine review](https://github.com/Sonoran-Solutions/SonoranClaudeRouter/pull/1#issuecomment-6272603341) established the native mod and one-shot wrapper interfaces.
 
-This plan supersedes the larger collector-and-adapters proposal. The current launcher contracts and native mod API were identified in the [owner-machine review](https://github.com/Sonoran-Solutions/SonoranClaudeRouter/pull/1#issuecomment-6272603341). Preserve existing orchestration policy and worker result/exit semantics.
+## 0. Native pane
 
-## Phase 0 — native pane skeleton
+Copy the installed Claude Code 2.1.299 `plugin-authoring/pane.tsx` example. Use `$.ui.open` + `ui.render` to display a read-only `Pane` with synthetic workers.
 
-Use the installed Claude Code 2.1.299 `plugin-authoring` skill's `pane.tsx` example. Open a read-only `Pane` with `$.ui.open` and `ui.render`, render a synthetic worker list, then prove that it opens and updates in the owner's desktop app. No alternate browser/terminal UI or interface-feasibility study.
+**Gate:** pane opens, updates, and closes cleanly in the desktop app. Record a screenshot and installed version; no fallback frontend.
 
-**Gate:** pane smoke test with version, screenshot, and proof that closing it does not change the parent session.
+## 1. External runners first
 
-## Phase 1 — external runners first
+Preserve the current wrappers and their process ownership. Give every launch a unique `$XDG_RUNTIME_DIR/orchestrator/<run-id>.jsonl` (private directory `0700`; files `0600`), with start/exit markers and **original exit code**.
 
-Edit only the existing one-shot wrappers at `~/.claude/skills/orchestrator`:
+| Runner | Minimal change | Expected visibility |
+| --- | --- | --- |
+| Codex | Add `--json` to one-shot `codex exec`; tee JSONL; keep `-o` output | Live structured events |
+| Pi | Tee current one-shot `pi -p --mode json` stream; retain final parsing | Live JSONL; **no RPC** |
+| agy | Keep `agy --output-format json`; record final JSON after exit | Start/exit and **final-only** |
 
-- **Codex:** add `--json` to `codex exec`, tee stdout JSONL into `$XDG_RUNTIME_DIR/orchestrator/<run-id>.jsonl`, and retain `-o` plus the existing final return behavior.
-- **Pi:** tee the existing `pi -p --mode json` stream rather than buffering it invisibly; keep the current final parsing. **Do not switch to RPC**. Its model traffic uses OpenRouter through Pi.
-- **agy:** retain `agy --output-format json`. Emit run metadata while active and one final JSONL result only after completion; label it **final-only**.
+Pane polls files with `$.fs` / `$.clock.every`, renders complete records, tolerates partial/malformed lines, and bounds recent displayed events in `$.state`. No collector, socket, database, or durable replay protocol.
 
-Build the pane's `$.fs` / `$.clock.every` polling view for these per-run files. Keep a bounded recent-event display in `$.state` and handle incomplete trailing lines and corrupt JSON visibly. Ensure start and end markers use unique run IDs, original exit statuses, private directory/file permissions (`0700`/`0600`), and explicit unavailability if logging fails.
+**Gate:** Codex and Pi each show a real event *before exit*; agy is accurately marked final-only. Verify same final result and exit code with monitoring on/off, including when log writing fails.
 
-**Gate:** Codex and Pi show at least one genuine event **before** their one-shot process exits; agy shows honest start/final-only status. Compare normal output, final result, and exit code with monitoring disabled. Inject an unwritable log destination and verify the worker still finishes normally.
+## 2. Claude attribution
 
-## Phase 2 — Claude-native attribution
+Show Claude-native agent IDs/models and parent/task relationships through `agent.spawn`, `$.agent.list()`, and only supported `turn.step` content. Do not invent raw reasoning or scrape transcripts. Any quota display reads existing `usage.sh` data with source age; OpenRouter is Pi's backend, not another worker.
 
-Add `agent.spawn` and `$.agent.list()` worker IDs and parent/task links to the same pane, using `turn.step` only for content it actually exposes. Do not duplicate native transcripts or invent unavailable reasoning. Display existing `usage.sh` quota data separately with a source timestamp, only if doing so does not invoke new model calls.
+**Gate:** concurrent Claude/Codex/Pi work remains correctly separated.
 
-**Gate:** simultaneous Claude, Codex, and Pi work remains correctly attributed to separate runs; missing source fields are labelled unavailable.
+## 3. Acceptance
 
-## Phase 3 — hardening and owner acceptance
+Exercise two simultaneous runs with identical titles, noisy output, incomplete JSONL, unwritable logs, pane close/reopen, and untrusted terminal text. Verify private permissions, bounded UI memory, honest error/status labels, preserved wrapper behavior, and no permission, steering, or cancellation hooks.
 
-Test concurrent sessions, two workers with the same task name, partial/malformed records, file permission errors, a long-running noisy worker, and closing/reopening the pane. Check bounded UI memory, safe rendering of hostile terminal text, private log permissions, and clearly distinguish event silence from worker failure.
+**Gate:** attach sanitized evidence, commands, versions, observed latency/granularity, tests run/not run, and owner decision. Keep implementation PRs unmerged with auto-merge off pending approval.
 
-**Gate:** one evidence report with installed versions, exact wrappers, before/after result equivalence, live-event screenshots/timestamps, known final-only/streaming limits, checks run/not run, and owner approval.
-
-## Not in scope
-
-No collector, socket, browser viewer, persistent ingestion cursor, direct OpenRouter adapter, persistent Pi RPC, process relaunch, model switching, prompt steering, permission approvals, or cancellation. These add complexity without solving the immediate blind spot.
-
-**Merge policy:** implementation PRs remain unmerged, with auto-merge off, until explicitly approved. This documentation PR does not authorize wrapper changes.
+**Deferred:** process takeover, interactive controls, persistent Pi RPC, direct OpenRouter loop, remote viewer, Sonoran Hub, and any separate collector. See [design](AGENT_INSPECTOR_DESIGN.md).
