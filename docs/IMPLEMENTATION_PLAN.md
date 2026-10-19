@@ -9,7 +9,7 @@ Copy the installed Claude Code 2.1.299 `plugin-authoring/pane.tsx` example. Use 
 
 **Gate:** pane opens, updates, and closes cleanly in the desktop app. Record a screenshot and installed version; no fallback frontend.
 
-**Done:** [`mod/agent-inspector/`](../mod/agent-inspector/) (validate + 18 plugin tests on 2.1.299). **Partly met:** the owner opened it in the desktop app (`/agent-inspector` → opened). **Open:** person confirms it updates and closes cleanly.
+**Done:** [`mod/agent-inspector/`](../mod/agent-inspector/) (validate + 30 plugin tests on 2.1.299). **Partly met:** the owner opened it in the desktop app (`/agent-inspector` → opened). **Open:** person confirms it updates and closes cleanly.
 
 ## 1. External runners first
 

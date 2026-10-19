@@ -10,12 +10,13 @@ Paths and run ids below are shortened; no prompts, keys or logs are committed.
 | --- | --- | --- |
 | Wrapper behaviour (fakes, no network) | `bash tests/wrappers.test.sh` | all checks PASS, `0 checks failed` |
 | Mod manifest/hooks | `claude plugin validate mod/agent-inspector` (2.1.299) | passed; only warning: no `author` field |
-| Mod unit + pane tests | `claude plugin test mod/agent-inspector` (2.1.299) | 18 pass, 0 fail (terminal and desktop surfaces) |
+| Mod unit + pane tests | `claude plugin test mod/agent-inspector` (2.1.299) | 30 pass, 0 fail across 3 files (terminal and desktop surfaces); 18 at the first submission, 27 after the first review |
 | Mod types | `tsc` 5.6.3 with the types header `tsconfig.json` | no errors |
 
 `claude plugin validate` lists the hooks as `session.start`, `command.run{agent-inspector}`, `agent.spawn`
-(observe-only, pass-through `.catch`), `ui.render{Pane, agent-inspector}`; env reads `XDG_RUNTIME_DIR` only;
-no `tool.call`, `tool.check`, `prompt.*` or `session.append` hooks.
+(observe-only, `gating hook without .catch`: it forwards the spawn exactly once, see the review table below),
+`ui.render{Pane, agent-inspector}`; env reads `XDG_RUNTIME_DIR` only; no `tool.call`, `tool.check`, `prompt.*` or
+`session.append` hooks.
 
 The wrapper suite covers: identical stdout/stderr/exit code with `ORCH_RUNLOG=0` vs on (exit 0 and 3) for all
 three wrappers; start-first/exit-last records with the returned exit code; `0700` directory and `0600` file; run-id
@@ -100,6 +101,13 @@ revised wrapper wrote a 527-byte lifecycle file (`exit_code 0`, `segments 1`) an
 (`revise wrappers…`, 595 records) and a Codex worker (`concurrency gate (codex)`) ran through the instrumented
 wrappers at the same time; each wrote its own run files with its own label and exit. Whether the pane displayed
 them correctly side by side has not yet been confirmed by a person.
+
+## Re-review revision (2026-10-19, review 5576337736)
+
+| Finding | Change | Proof |
+| --- | --- | --- |
+| P1 agy final response could push the lifecycle file over the read limit | `orchestrator.final` redacts first, then caps `response` at `ORCH_RUNLOG_FINAL_MAX_CHARS` (default 65536) and `status` at 200 characters, and records `response_truncated` / `response_chars`; the caller's stdout is untouched. The mod shows a truncation warning beside the final, and a lifecycle file that is still over the limit (old uncapped logs) yields one "status unknown (not failed)" warning instead of silence. | wrapper tests: a 5,000,000-character agy response leaves stdout identical to logging off and complete, keeps the lifecycle file under 512 KiB with the exit record last, records the truncation, and never logs a secret placed across the cut; cap is configurable; small responses are flagged untruncated. Mod tests (30 pass): capped final + exit 0 shows `exited 0`, the final and the warning on terminal and desktop; an oversized lifecycle file shows `unknown` with one warning and is never read |
+| P3 stale evidence and PR description | test counts and the `.catch` wording corrected above; PR description rewritten to the current state | — |
 
 ## Live gate, phase 0: native pane in the desktop app
 
