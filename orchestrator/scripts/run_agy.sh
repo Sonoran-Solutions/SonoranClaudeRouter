@@ -5,8 +5,10 @@
 # prompts; the prompt file bounds what it may touch. Upgrade path: --mode accept-edits once agy
 # print mode auto-denies instead of hanging on shell approvals.
 set -euo pipefail
+. "$(dirname "$0")/_runlog.sh" agy "$@"
 p=${1:?prompt file}; w=${2:?workdir}; m=${3:-}
 t=${ORCH_TIMEOUT:-900}
+_runlog_init agy "$p" "$w" "$m"
 cd "$w"
 res=$(timeout $((t+30)) agy --output-format json --print-timeout "${t}s" --disable-slash-commands \
   --dangerously-skip-permissions ${m:+--model "$m"} -p="$(cat "$p")" 2>/dev/null) \

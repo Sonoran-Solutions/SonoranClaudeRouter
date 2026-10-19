@@ -5,6 +5,7 @@
 # pi keeps its read/bash/edit/write tools and runs them without asking. ORCH_PI_NO_TOOLS=1 for text-only.
 # Uses --mode json: text mode was seen to hang for minutes on tool-using briefs (2026-10-16).
 set -euo pipefail
+. "$(dirname "$0")/_runlog.sh" pi "$@"
 . "$(dirname "$0")/_env.sh"
 p=${1:?prompt file}; w=${2:?workdir}; m=${3:-${ORCH_PI_MODEL:-}}
 if [ -z "$m" ]; then
@@ -16,8 +17,9 @@ if [ -z "$m" ]; then
   fi
   m=$(cat "$f" 2>/dev/null || true); m=${m:-~deepseek/deepseek-flash-latest}
 fi
+_runlog_init pi "$p" "$w" "$m"
 cd "$w"
-ev=$(timeout "${ORCH_TIMEOUT:-900}" pi -p --provider openrouter --model "$m" --no-session --no-extensions \
+ev=$(_runlog_run timeout "${ORCH_TIMEOUT:-900}" pi -p --provider openrouter --model "$m" --no-session --no-extensions \
   --no-skills --no-context-files ${ORCH_PI_NO_TOOLS:+--no-tools} --mode json "$(cat "$p")" 2>/dev/null) \
   || { rc=$?; echo "pi failed or timed out (rc=$rc)" >&2; printf '%s\n' "$ev" | grep -i error | tail -3 | cut -c1-300 >&2; exit $rc; }
 printf '%s\n' "$ev" | jq -r 'select(.type=="message_end" and .message.role=="assistant") | [.message.content[]? | select(.type=="text") | .text] | join("\n")' | awk 'NF' | tail -n 1
