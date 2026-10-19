@@ -63,14 +63,18 @@ call. Its wrapper is covered by the fake-worker suite only.
 
 ## Observations and caveats
 
-- **Pi startup stall (not caused by the wrappers).** Two wrapped Pi runs produced no record at all, not even pi's
-  first `session` line, and ran into the timeout. A controlled A/B run on 2026-10-19 (6 direct `pi -p` runs
-  without any wrapper, stderr captured, plus 6 wrapped runs, all started together, `ORCH_TIMEOUT=90`) stalled
-  **12 of 12, direct runs included**, with empty stderr. A single direct run right afterwards printed nothing for
-  over 6 s while holding one established HTTPS connection to a Cloudflare address (OpenRouter's CDN), then
-  completed. Working hypothesis, unproven: pi fetches remote model metadata at startup for an id outside its
-  static list (it warns `Model "deepseek/deepseek-v4.1-flash-1017" not found for provider "openrouter"`), and that
-  request can hang without a timeout. Tracked as a separate investigation; no wrapper change is proposed for it.
+- **Fixed: Pi startup stall (root cause: inherited stdin).** `pi -p` reads all of a non-TTY stdin before starting
+  and waits for EOF with no timeout (pi 0.86.0 `dist/main.js:705-708`, `readPipedStdin()`). `run_pi.sh` passed the
+  prompt as an argument but left stdin inherited; the desktop app's tool shells sometimes hand over a socket that
+  never reaches EOF (other calls get `/dev/null`, hence the intermittency), so pi printed nothing and hung until the
+  timeout. Ruled out: the logging wrapper (direct runs stall identically: 12/12 in an A/B run), the network (under
+  `strace` a stalled pi made **no `connect` call at all**), the unknown-model warning (local fallback) and pi's lock
+  directories. Proof: with an inherited open stdin, 3/3 direct runs stalled while 3/3 with `< /dev/null` finished in
+  0.9–2.5 s; with stdin held open on a FIFO, the original wrapper hung to the timeout and the fixed one answered in
+  1.4 s. Fix: `< /dev/null` on the pi call. Regression test: a fake pi that reads stdin to EOF, run with stdin held
+  open on a FIFO (fails before the fix, passes after). `run_codex.sh` is unaffected (prompt on stdin from a file).
+  The same one-line fix was applied to the owner's live `~/.claude/skills/orchestrator/scripts/run_pi.sh` on
+  2026-10-19 with a dated backup.
 - **Fixed: Pi timeout status.** The original `run_pi.sh` failure branch ran `printf | grep -i error | tail | cut`
   under `set -euo pipefail`; with no `error` line, grep's status 1 ended the script before `exit $rc`, so a silent
   timeout returned 1 instead of 124. The pipeline now uses `{ grep -i error || true; }`. A test with a fake pi that

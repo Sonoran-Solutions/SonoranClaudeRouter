@@ -3,13 +3,13 @@
 Drop-in replacements for the three external-worker wrappers in `~/.claude/skills/orchestrator/scripts/`. Each
 launch also writes a private per-run log for the Agent Inspector mod, as specified in
 [`docs/LOG_CONTRACT.md`](../docs/LOG_CONTRACT.md). Arguments, environment variables, stdout, stderr and exit codes
-are unchanged (one deliberate exception: the `run_pi.sh` timeout status fix below); logging is a side channel that can fail without affecting the worker.
+are unchanged (deliberate exceptions: the two `run_pi.sh` bug fixes below); logging is a side channel that can fail without affecting the worker.
 
 | File | Change from the live wrapper |
 | --- | --- |
 | `scripts/_runlog.sh` | new: lifecycle file (start/final/exit), rotating event segments, directory and permission checks, retention, redaction, `tee -p` side branch |
 | `scripts/run_codex.sh` | adds `--json`; the JSONL stream goes to the log instead of `/dev/null`; `-o` result unchanged |
-| `scripts/run_pi.sh` | tees the existing `--mode json` stream into the log (trimmed, redacted); final parsing unchanged; a timeout with no `error` output now exits 124 instead of 1 (bug fix) |
+| `scripts/run_pi.sh` | tees the existing `--mode json` stream into the log (trimmed, redacted); final parsing unchanged; a timeout with no `error` output now exits 124 instead of 1, and pi gets `< /dev/null` so an inherited never-closing stdin can't hang it (bug fixes) |
 | `scripts/run_agy.sh` | start record, then one `orchestrator.final` record after agy exits (final-only) |
 
 `_env.sh`, `usage.sh`, `models.sh` and `selfcheck.sh` are not part of this repository and are not modified.

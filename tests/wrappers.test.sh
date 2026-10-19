@@ -31,6 +31,8 @@ while (($#)); do
 done
 if [[ $provider == codex ]]; then [[ -n $out && -n $json ]]; fi
 if [[ -n ${FAKE_UMASK_FILE:-} ]]; then : > "$FAKE_UMASK_FILE"; fi
+# Like real pi -p: read all of a non-TTY stdin before starting (pi main.js readPipedStdin, no timeout).
+if [[ -n ${FAKE_READ_STDIN:-} ]]; then cat > /dev/null; fi
 if [[ -n ${FAKE_SLEEP:-} ]]; then
   [[ $provider != pi || -n ${FAKE_SILENT:-} ]] || printf '{"type":"error","error":"waiting for timeout"}\n'
   if [[ -n $print_timeout ]]; then timeout "$print_timeout" sleep "$FAKE_SLEEP"; else sleep "$FAKE_SLEEP"; fi
@@ -389,6 +391,23 @@ check 'pi silent timeout returns 124 (not 1)' test "$result" = 124
 check 'pi silent timeout exit record 124/timed_out' jq -se \
   'any(.[]; .type == "orchestrator.exit" and .exit_code == 124 and .timed_out == true)' "$log"
 check 'pi silent timeout lifecycle only orchestrator' jq -se 'all(.[]; .type | startswith("orchestrator."))' "$log"
+
+# Pi with an inherited stdin that never reaches EOF (the desktop app's tool shell holds a socket open):
+# the wrapper must give pi an empty stdin instead of hanging until the timeout.
+stdin_fifo=$tmp/stdin.fifo
+mkfifo "$stdin_fifo"
+sleep 30 > "$stdin_fifo" &
+holder=$!
+started=$SECONDS
+env XDG_RUNTIME_DIR="$tmp/missing" ORCH_TIMEOUT=10 FAKE_READ_STDIN=1 \
+  bash "$tmp/scripts/run_pi.sh" "$tmp/prompt.txt" "$tmp/work" < "$stdin_fifo" > "$tmp/stdin.out" 2> "$tmp/stdin.err" \
+  && stdin_rc=0 || stdin_rc=$?
+stdin_secs=$((SECONDS - started))
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+check 'pi open stdin does not hang (rc 0)' test "$stdin_rc" = 0
+check 'pi open stdin finishes well before timeout' test "$stdin_secs" -lt 8
+check 'pi open stdin output unchanged' test "$(cat "$tmp/stdin.out")" = done
 
 parallel=$tmp/parallel
 mkdir -m 700 "$parallel"
