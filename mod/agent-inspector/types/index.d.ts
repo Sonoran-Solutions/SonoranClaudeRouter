@@ -24,10 +24,26 @@ export type DisplayEvent = {
   isError?: boolean
 }
 
-export type RunExit = { code: number; timedOut: boolean; durationMs: number | null }
+export type RunExit = {
+  code: number
+  timedOut: boolean
+  durationMs: number | null
+  /** Highest event segment the wrapper wrote (exit record), when given. */
+  segments: number | null
+}
 
 /** Where the reader stands in one log file. `consumed` is a UTF-16 offset. */
-export type RunCursor = { size: number; mtimeMs: number; consumed: number }
+export type FileCursor = {
+  size: number
+  mtimeMs: number
+  consumed: number
+  /** A segment read to its end after its successor existed: never read again. */
+  isDone?: boolean
+  /** Over the read limit; warned once. */
+  isSkipped?: boolean
+  /** The last read error, so a repeat is not warned about every poll. */
+  error?: string | null
+}
 
 export type RunSummary = {
   id: string
@@ -47,8 +63,14 @@ export type RunSummary = {
   isAlive: boolean | null
   hasStart: boolean
   warnings: number
-  cursor: RunCursor
-  isTooLarge: boolean
+  /** The lifecycle file `<run-id>.jsonl`: start, final, exit. */
+  lifecycle: FileCursor
+  /** Event segments `<run-id>.<n>.jsonl` still present, keyed by `n`. */
+  segments: Record<string, FileCursor>
+  /** The highest segment number seen so far (0: none). */
+  highestSegment: number
+  /** Segments whose events were never (fully) read: rotated away or over the read limit. */
+  segmentsOmitted: number
   isGone: boolean
 }
 

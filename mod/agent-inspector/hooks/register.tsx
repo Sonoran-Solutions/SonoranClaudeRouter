@@ -24,14 +24,15 @@ import type {
   RunEvents,
   RunSummary,
 } from '../types'
+import type { ListedFile, ListedRun } from './reader'
+import { advanceRunFiles } from './reader'
+import type { RunLogName } from './runlog'
 import {
   boundRuns,
   clean,
   clockTime,
   emptyEvents,
   formatDuration,
-  ingestLines,
-  MAX_FILE_BYTES,
   MAX_RUNS,
   MAX_STORED_CHARS,
   newRun,
@@ -40,7 +41,6 @@ import {
   pushBounded,
   SHOWN_CHARS,
   stateLabel,
-  takeCompleteLines,
 } from './runlog'
 
 const PANE = 'agent-inspector'
@@ -121,16 +121,29 @@ async function pollRunLogs($: $, now: number): Promise<void> {
 
   // Only contract names, only regular files (no links): a read path is the
   // directory plus a name that matched the run-id pattern, never file content.
-  const files = new Map<string, { name: ReturnType<typeof parseRunLogName> & {}; size: number; mtimeMs: number }>()
+  const files = new Map<string, { name: RunLogName; lifecycle: ListedFile | null; segments: Map<number, ListedFile> }>()
   for (const entry of entries) {
     if (entry.kind !== 'file' || entry.isLink) continue
     const name = parseRunLogName(entry.name)
-    if (name !== null) files.set(name.id, { name, size: entry.size, mtimeMs: entry.mtimeMs })
+    if (name === null) continue
+    const run = files.get(name.id) ?? { name, lifecycle: null, segments: new Map() }
+    const listed = { size: entry.size, mtimeMs: entry.mtimeMs }
+    if (name.segment === null) run.lifecycle = listed
+    else run.segments.set(name.segment, listed)
+    files.set(name.id, run)
   }
 
   const status = await read($, STATUS)
   const dropped = new Set(status.dropped.filter(id => files.has(id)))
-  const known = new Map((await read($, RUNS)).map(run => [run.id, run]))
+  const known = new Map<string, RunSummary>()
+  for (const run of await read($, RUNS)) {
+    // A summary from before the segmented layout (hot reload): start that run over.
+    if (run.segments === undefined || run.lifecycle === undefined) {
+      await $.state.set({ ...EVENTS, id: run.id }, emptyEvents())
+      continue
+    }
+    known.set(run.id, run)
+  }
   for (const [id, file] of files) {
     if (!known.has(id) && !dropped.has(id)) known.set(id, newRun(file.name))
   }
@@ -140,68 +153,46 @@ async function pollRunLogs($: $, now: number): Promise<void> {
     await $.state.set({ ...EVENTS, id }, emptyEvents())
   }
 
+  // One run's failure never starves the others: RUNS and STATUS update every poll.
   const runs: RunSummary[] = []
-  for (const run of bounded.kept) runs.push(await advanceRun($, dir, run, files.get(run.id), now))
+  for (const run of bounded.kept) runs.push(await advanceRunSafely($, dir, run, files.get(run.id), now))
 
   await update($, RUNS, () => runs)
   await update($, STATUS, (): InspectorStatus => ({ dir: 'ok', detail: null, polledAt: now, dropped: [...dropped] }))
 }
 
-async function advanceRun(
-  $: $,
-  dir: string,
-  run: RunSummary,
-  file: { size: number; mtimeMs: number } | undefined,
-  now: number,
-): Promise<RunSummary> {
-  if (file === undefined) return run.isGone ? run : { ...run, isGone: true, isAlive: null }
-  let next: RunSummary = run.isGone ? { ...run, isGone: false } : run
+async function advanceRunSafely($: $, dir: string, run: RunSummary, listed: ListedRun | undefined, now: number): Promise<RunSummary> {
+  try {
+    return await advanceRun($, dir, run, listed, now)
+  } catch (error) {
+    // Keep the previous summary and cursors (retried next poll); say so on the run.
+    const text = `telemetry: could not update this run (${clean(error instanceof Error ? error.message : String(error), 300)}); retrying`
+    try {
+      const events = await readEvents($, run.id)
+      await $.state.set({ ...EVENTS, id: run.id }, pushBounded(events, [{ seq: events.nextSeq, kind: 'warning', at: now, text }]))
+    } catch {
+      // The warning count below still says it.
+    }
+    return { ...run, warnings: run.warnings + 1 }
+  }
+}
 
-  const isChanged = file.size !== run.cursor.size || file.mtimeMs !== run.cursor.mtimeMs
-  if (isChanged && !run.isTooLarge) next = await readNewLines($, dir, next, file, now)
+async function advanceRun($: $, dir: string, run: RunSummary, listed: ListedRun | undefined, now: number): Promise<RunSummary> {
+  const events = await readEvents($, run.id)
+  // ponytail: $.fs has no ranged read in 2.1.299, so a changed file is read
+  // whole and sliced at its consumed offset. Ceiling: 4 MiB per file (segments
+  // stay near 2 x ORCH_RUNLOG_SEGMENT_BYTES); a ranged read would lift it.
+  const io = { read: (path: string) => $.fs.read(path) }
+  const advanced = await advanceRunFiles(io, dir, run, events, listed, now)
+  if (advanced.events !== events) await $.state.set({ ...EVENTS, id: run.id }, advanced.events)
+  let next = advanced.run
 
-  if (next.exit === null && next.pid !== null) {
+  if (next.exit === null && next.pid !== null && !next.isGone) {
     // Read-only liveness: does /proc/<pid> exist (pid is a validated integer).
     const isAlive = await $.fs.exists(`/proc/${next.pid}`).catch(() => null)
     if (isAlive !== next.isAlive) next = { ...next, isAlive }
   }
   return next
-}
-
-async function readNewLines(
-  $: $,
-  dir: string,
-  run: RunSummary,
-  file: { size: number; mtimeMs: number },
-  now: number,
-): Promise<RunSummary> {
-  let events = await readEvents($, run.id)
-  const warn = (text: string): RunEvents =>
-    pushBounded(events, [{ seq: events.nextSeq, kind: 'warning', at: now, text }])
-
-  if (file.size > MAX_FILE_BYTES) {
-    events = warn(`telemetry: log is over ${MAX_FILE_BYTES / 1024 / 1024} MiB, the most one read takes; later events are not shown`)
-    await $.state.set({ ...EVENTS, id: run.id }, events)
-    return { ...run, isTooLarge: true, warnings: run.warnings + 1, cursor: { ...run.cursor, size: file.size, mtimeMs: file.mtimeMs } }
-  }
-
-  // ponytail: $.fs has no ranged read in 2.1.299, so the file is read whole
-  // (only when its size or mtime changed) and sliced at the consumed offset.
-  // Ceiling is the 4 MiB read limit above; a ranged read would lift it.
-  const text = await $.fs.read(`${dir}/${run.id}.jsonl`)
-  let consumed = run.cursor.consumed
-  let next = run
-  if (file.size < run.cursor.size || consumed > text.length) {
-    events = warn('telemetry: log file shrank or was replaced; reading it again from the start')
-    next = { ...next, warnings: next.warnings + 1 }
-    consumed = 0
-  }
-  const taken = takeCompleteLines(text, consumed)
-  const ingested = ingestLines(next, events, taken.lines, now)
-  if (taken.lines.length > 0 || ingested.events !== events) {
-    await $.state.set({ ...EVENTS, id: run.id }, ingested.events)
-  }
-  return { ...ingested.run, cursor: { size: file.size, mtimeMs: file.mtimeMs, consumed: taken.consumed } }
 }
 
 // ---------------------------------------------------------------------------
@@ -332,15 +323,24 @@ export const register: Register = on => {
     }
   })
 
-  // Observe only: the spawn goes ahead exactly as asked, and a failure here
-  // (or in the handler) never blocks or alters it.
+  // Observe only. `next(e)` is called exactly once, first; its result is
+  // returned as is and its rejection propagates unchanged (the await rethrows).
+  // Bookkeeping runs after it inside try/catch, so it can never fail the hook.
+  // Deliberately no `.catch`: without one, a hook that fails after `next` is
+  // skipped with its last `next` standing (nothing re-dispatched), and one
+  // asked beneath its own frame (re-entry) is left out, so the spawn passes
+  // straight through. A handler could only add a second path to `next`.
   on('agent.spawn', async ($, e, next) => {
     const result = await next(e)
-    if (result.deny === undefined && result.agentId !== undefined) {
-      await recordSpawn($, e, result.agentId, result.model).catch(() => undefined)
+    try {
+      if (result.deny === undefined && result.agentId !== undefined) {
+        await recordSpawn($, e, result.agentId, result.model)
+      }
+    } catch {
+      // Bookkeeping only; the spawn's result is unaffected.
     }
     return result
-  }).catch(($, e, next) => next(e))
+  })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
@@ -416,7 +416,7 @@ export const register: Register = on => {
       detail = (
         <Box flexDirection="column">
           {summary}
-          {eventList(Text, Box, events, view, Math.max(3, rows - used), width)}
+          {eventList(Text, Box, events, view, Math.max(3, rows - used), width, run.segmentsOmitted ?? 0)}
         </Box>
       )
     }
@@ -522,7 +522,7 @@ function runDetail(Text: TextC, Box: BoxC, run: RunSummary, now: number): Render
       <Text dimColor>
         worker reported: {run.reported ?? '—'} · observed exit status: {exit} · telemetry warnings: {run.warnings}
         {run.isGone ? ' · log file removed' : ''}
-        {run.isTooLarge ? ' · log too large to read further' : ''}
+        {run.segmentsOmitted > 0 ? ` · segments omitted: ${run.segmentsOmitted}` : ''}
       </Text>
     </Box>
   )
@@ -539,9 +539,21 @@ const KIND_COLOR: Record<string, string> = {
   other: 'inactive',
 }
 
-function eventList(Text: TextC, Box: BoxC, events: RunEvents, view: InspectorView, room: number, width: number): RenderElement {
+function eventList(
+  Text: TextC,
+  Box: BoxC,
+  events: RunEvents,
+  view: InspectorView,
+  room: number,
+  width: number,
+  segmentsOmitted: number,
+): RenderElement {
   const items = events.items
-  if (items.length === 0) return <Text dimColor>No events yet.</Text>
+  const lost =
+    segmentsOmitted > 0
+      ? `events of ${segmentsOmitted} log segment${segmentsOmitted === 1 ? '' : 's'} omitted (rotated away or over the read limit; not counted)`
+      : ''
+  if (items.length === 0) return <Text dimColor>{lost || 'No events yet.'}</Text>
   const end =
     view.anchorSeq === null
       ? items.length
@@ -560,6 +572,7 @@ function eventList(Text: TextC, Box: BoxC, events: RunEvents, view: InspectorVie
   const above = end - shown.length
   const below = items.length - end
   const older = [
+    lost,
     events.omitted > 0 ? `${events.omitted} older event${events.omitted === 1 ? '' : 's'} omitted (only the newest ${items.length} are kept)` : '',
     above > 0 ? `${above} more above (u to scroll)` : '',
   ].filter(Boolean)

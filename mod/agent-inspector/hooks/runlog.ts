@@ -1,6 +1,6 @@
 // Pure run-log logic: names, line splitting, record -> display event mapping,
 // sanitizing and bounding. No `$`, so `claude plugin test` covers it directly.
-// The contract is docs/LOG_CONTRACT.md (v1).
+// The contract is docs/LOG_CONTRACT.md (v1, segmented).
 import type {
   DisplayEvent,
   EventKind,
@@ -15,21 +15,28 @@ export const MAX_RUNS = 50
 export const SHOWN_CHARS = 2000
 /** Kept per event; the expand control shows up to this. */
 export const MAX_STORED_CHARS = 20000
-/** `$.fs.read` rejects files over 4 MiB, so the reader stops there. */
+/** `$.fs.read` rejects files over 4 MiB: a single file over it is skipped. */
 export const MAX_FILE_BYTES = 4 * 1024 * 1024
 
-const RUN_LOG_NAME = /^(([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})([0-9]{3})Z-(codex|pi|agy)-[0-9a-f]{8})\.jsonl$/
+const RUN_LOG_NAME =
+  /^(([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})([0-9]{3})Z-(codex|pi|agy)-[0-9a-f]{8})(?:\.([1-9][0-9]{0,5}))?\.jsonl$/
 
-/** A contract run-log file name, or null. Every other name is ignored. */
-export function parseRunLogName(
-  name: string,
-): { id: string; executor: Executor; startedAt: number } | null {
+export type RunLogName = {
+  id: string
+  executor: Executor
+  startedAt: number
+  /** null: the lifecycle file `<run-id>.jsonl`; else the event segment `<run-id>.<n>.jsonl`. */
+  segment: number | null
+}
+
+/** A contract run-log file name (lifecycle or segment), or null. Every other name is ignored. */
+export function parseRunLogName(name: string): RunLogName | null {
   const m = RUN_LOG_NAME.exec(name)
   if (m === null) return null
-  const [, id, y, mo, d, h, mi, s, ms, ex] = m
+  const [, id, y, mo, d, h, mi, s, ms, ex, n] = m
   const startedAt = Date.UTC(+y!, +mo! - 1, +d!, +h!, +mi!, +s!, +ms!)
   if (!Number.isFinite(startedAt)) return null
-  return { id: id!, executor: ex as Executor, startedAt }
+  return { id: id!, executor: ex as Executor, startedAt, segment: n === undefined ? null : Number(n) }
 }
 
 /**
@@ -104,8 +111,10 @@ export function newRun(name: { id: string; executor: Executor; startedAt: number
     isAlive: null,
     hasStart: false,
     warnings: 0,
-    cursor: { size: 0, mtimeMs: 0, consumed: 0 },
-    isTooLarge: false,
+    lifecycle: { size: 0, mtimeMs: 0, consumed: 0 },
+    segments: {},
+    highestSegment: 0,
+    segmentsOmitted: 0,
     isGone: false,
   }
 }
@@ -283,7 +292,21 @@ function mapWrapper(type: string, r: Obj, run: RunSummary): Mapped {
           isError: code !== 0,
         }),
       ],
-      patch: { exit: { code, timedOut, durationMs }, isAlive: false },
+      patch: { exit: { code, timedOut, durationMs, segments: num(r.segments) }, isAlive: false },
+    }
+  }
+  if (type === 'orchestrator.oversize') {
+    const bytes = num(r.bytes)
+    const kind = str(r.provider_type)
+    return {
+      events: [
+        ev(
+          'warning',
+          `provider record of ${bytes ?? 'unknown'} bytes${kind === null ? '' : ` (type ${kind})`} was too large to log`,
+          { at },
+        ),
+      ],
+      patch: { warnings: run.warnings + 1 },
     }
   }
   return { events: [ev('other', `other: ${type}`, { at })], patch: {} }

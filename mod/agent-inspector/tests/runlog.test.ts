@@ -67,7 +67,10 @@ describe('run-log names', () => {
       id: '20261019T171939660Z-pi-3f9a1c2e',
       executor: 'pi',
       startedAt: Date.UTC(2026, 9, 19, 17, 19, 39, 660),
+      segment: null,
     })
+    expect(parseRunLogName('20261019T171939660Z-pi-3f9a1c2e.1.jsonl')?.segment).toBe(1)
+    expect(parseRunLogName('20261019T171939660Z-codex-3f9a1c2e.123456.jsonl')?.segment).toBe(123456)
     for (const bad of [
       '../x.jsonl',
       '../20261019T171939660Z-pi-3f9a1c2e.jsonl',
@@ -77,6 +80,13 @@ describe('run-log names', () => {
       '20261019T171939660Z-claude-3f9a1c2e.jsonl',
       '20261019T17193966Z-pi-3f9a1c2e.jsonl',
       '20261019T171939660Z-pi-3f9a1c2e.json',
+      '20261019T171939660Z-pi-3f9a1c2e.0.jsonl',
+      '20261019T171939660Z-pi-3f9a1c2e.01.jsonl',
+      '20261019T171939660Z-pi-3f9a1c2e.1234567.jsonl',
+      '20261019T171939660Z-pi-3f9a1c2e.-1.jsonl',
+      '20261019T171939660Z-pi-3f9a1c2e..jsonl',
+      '20261019T171939660Z-pi-3f9a1c2e.1.2.jsonl',
+      '../20261019T171939660Z-pi-3f9a1c2e.1.jsonl',
       'sub/20261019T171939660Z-pi-3f9a1c2e.jsonl',
       '',
     ]) {
@@ -122,7 +132,7 @@ describe('record mapping', () => {
     expect(events.items[6]?.text).toBe('done')
     expect(events.items[7]?.text).toContain('in 40353')
     expect(run.granularity).toBe('live')
-    expect(run.exit).toEqual({ code: 0, timedOut: false, durationMs: 5340 })
+    expect(run.exit).toEqual({ code: 0, timedOut: false, durationMs: 5340, segments: null })
     expect(stateLabel(run)).toBe('exited 0')
     expect(run.reported).toBeNull()
     expect(run.warnings).toBe(0)
@@ -192,6 +202,15 @@ describe('record mapping', () => {
     expect(stateLabel(run)).toBe('unknown') // pid not seen alive yet: unknown, never failed
   })
 
+  test('an oversize placeholder is a warning event', () => {
+    const { run, events } = ingest('pi', [
+      JSON.stringify({ v: 1, type: 'orchestrator.oversize', run_id: 'x', ts: '2026-10-19T17:19:41.000Z', bytes: 3145728, provider_type: 'tool_execution_end' }),
+    ])
+    expect(events.items.map(one => one.kind)).toEqual(['warning'])
+    expect(events.items[0]?.text).toBe('provider record of 3145728 bytes (type tool_execution_end) was too large to log')
+    expect(run.warnings).toBe(1)
+  })
+
   test('unknown record types become a compact other row', () => {
     const { events } = ingest('codex', ['{"type":"brand.new","payload":"x"}', '{"no":"type"}'])
     expect(events.items.map(one => one.text)).toEqual(['other: brand.new', 'other: (record without a type)'])
@@ -247,7 +266,7 @@ describe('bounds', () => {
     const id = (minute: number) => `20261019T17${minute}000000Z-pi-0000000${minute}`
     const run = (minute: number, isExited: boolean): RunSummary => ({
       ...newRun({ id: id(minute), executor: 'pi', startedAt: minute }),
-      exit: isExited ? { code: 0, timedOut: false, durationMs: 1 } : null,
+      exit: isExited ? { code: 0, timedOut: false, durationMs: 1, segments: null } : null,
     })
     const { kept, dropped } = boundRuns([run(1, false), run(2, true), run(3, true), run(4, false)], 2)
     expect(dropped.sort()).toEqual([id(2), id(3)])
