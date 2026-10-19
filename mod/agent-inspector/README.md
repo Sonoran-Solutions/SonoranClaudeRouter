@@ -12,8 +12,14 @@ A Claude Code (2.1.299) mod: a pane that shows what delegated workers are doing,
   `<run-id>.jsonl` (start, final, exit) and the event segments `<run-id>.<n>.jsonl`. Per run: executor,
   model, label, parent (or "not available"), start time, when the last event was *seen*, state (`running`,
   `unknown`, `exited N`, `timed out`), granularity (`live` / `final-only`), the worker-reported result next to the
-  observed exit status, and telemetry warnings. Below the list, the selected run's events, each labelled `message`,
-  `reasoning summary`, `tool call`, `tool output`, `status`, `final`, `warning` or `other: <type>`.
+  observed exit status, and telemetry warnings. The selected run's detail also has an origin line,
+  `Chat <title> · Project <basename> (<path>)`, from the start record's `session_id`, `session_title` and `project`:
+  which Claude Code chat launched the worker, marked `(this chat)` when it is the session showing the pane. Logs
+  written before those fields say `chat not recorded` / `project not recorded`. Wide panes (100+ columns) also show
+  the chat title dimly in each worker row. A stats line counts what the mod really has: events seen, tool calls among
+  the kept events (`≥` when older ones were dropped), runtime and the last event's age; no tokens or cost. Below
+  it, the selected run's events with a timestamp column, each labelled `message`, `reasoning summary`, `tool call`,
+  `tool output` (indented, dimmed, with a `│` gutter), `status`, `final`, `warning` or `other: <type>`.
 - **Claude agents**: what `agent.spawn` and `$.agent.list()` expose (id, type, model, description, status,
   parent). No transcript scraping.
 
@@ -42,7 +48,9 @@ Checks: `claude plugin validate mod/agent-inspector` and `claude plugin test mod
 ## Limitations
 
 - **Pane size.** The supported minimum pane size is 12 rows x 70 columns; below 24 rows the usage line, worker rows,
-  run summary and controls are single truncated lines.
+  run summary, origin line and controls are single truncated lines. From 32 rows Usage and the selected worker are
+  drawn as rounded cards under a title and subtitle; in between, as plain sections under a separator. Every fixed
+  line is one truncated row, so the layout always fits the pane's body.
 - **Read-only.** No tool or session-append hooks; no steering, cancellation, model switching or file writes. The
   only process it runs is `usage.sh` (a read-only status script that prints one JSON line and never prints keys),
   only while the pane is placed. The `agent.spawn` hook only observes: it forwards the spawn exactly once and returns

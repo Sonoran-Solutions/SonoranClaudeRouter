@@ -32,14 +32,19 @@ through (after redaction, and for pi after field trimming, below), plus `orchest
 
 | `type` | When | Fields |
 | --- | --- | --- |
-| `orchestrator.start` | first line, before the worker starts | `v` (1), `run_id`, `executor` (`codex`/`pi`/`agy`), `model` (string or `null` = executor default), `label` (string or `null`), `parent` (string or `null`), `workdir`, `pid` (wrapper PID), `granularity` (`live` for codex/pi, `final-only` for agy), `ts` |
+| `orchestrator.start` | first line, before the worker starts | `v` (1), `run_id`, `executor` (`codex`/`pi`/`agy`), `model` (string or `null` = executor default), `label` (string or `null`), `parent` (string or `null`), `workdir`, `pid` (wrapper PID), `session_id` (the launching Claude Code session's `CLAUDE_CODE_SESSION_ID`, or `null` when absent/invalid), `session_title` (that session's last chat title, at most 200 characters, or `null`), `project` (that session's project directory, else `workdir`, else `null`), `granularity` (`live` for codex/pi, `final-only` for agy), `ts` |
 | provider record (segments) | while the worker runs | codex: `codex exec --json` events; pi: `pi --mode json` events |
 | `orchestrator.oversize` (segments) | in place of a provider line longer than the segment size | `v`, `run_id`, `ts`, `bytes` (the line's length), `provider_type` (its `.type`, or `null`) |
 | `orchestrator.final` | agy only, after it exits | `v`, `run_id`, `ts`, `status` (agy `.status`, at most 200 characters, or `null`), `response` (agy `.response`, redacted and then cut to `ORCH_RUNLOG_FINAL_MAX_CHARS` characters, default 65536, or `null`), `response_truncated` (`true` when cut), `response_chars` (length of the redacted response before the cut, or `null`), `parse_error` (`true` when agy's stdout was not JSON). The wrapper's stdout always carries the full response. |
 | `orchestrator.exit` | last line of the lifecycle file, always written when the wrapper exits (also on failure/timeout), after the event stream is flushed | `v`, `run_id`, `ts`, `exit_code` (the wrapper's own exit status, which is the worker's original status), `timed_out` (`exit_code == 124`), `duration_ms`, `segments` (highest segment number written, `0` if none) |
 
 `ts` is an ISO-8601 UTC timestamp with milliseconds. `label` comes from `ORCH_LABEL`, else the prompt file's
-basename. `parent` comes from `ORCH_PARENT` only; nothing infers it.
+basename. `parent` comes from `ORCH_PARENT` only; nothing infers it. `session_id`, `session_title` and `project` are
+best effort: they are read once at start from `$CLAUDE_CODE_SESSION_ID` and that session's transcript under
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/*/<session-id>.jsonl` (last `custom-title` record and first `cwd`), and
+are `null` (or `workdir`) when anything is missing or fails; that lookup reads at most `ORCH_RUNLOG_TRANSCRIPT_MAX_BYTES`
+(default 8 MiB) from each end of the transcript and gives up after `ORCH_RUNLOG_SESSION_TIMEOUT` seconds (default 2),
+leaving the fields `null`, so it never delays the worker; the worker's behaviour and exit status never change.
 
 A run whose lifecycle file has a start record and no exit record is **running** while the wrapper PID is alive;
 the mod must otherwise show it as **unknown**, never as failed. A segment that disappears before the mod has read it

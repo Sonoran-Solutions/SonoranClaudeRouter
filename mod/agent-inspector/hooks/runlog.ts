@@ -102,6 +102,9 @@ export function newRun(name: { id: string; executor: Executor; startedAt: number
     model: null,
     label: null,
     parent: null,
+    sessionId: null,
+    sessionTitle: null,
+    project: null,
     pid: null,
     granularity: name.executor === 'agy' ? 'final-only' : 'live',
     startedAt: name.startedAt,
@@ -253,6 +256,10 @@ function mapWrapper(type: string, r: Obj, run: RunSummary): Mapped {
       model: str(r.model) === null ? run.model : clean(str(r.model)!, 200),
       label: str(r.label) === null ? null : clean(str(r.label)!, 200),
       parent: str(r.parent) === null ? null : clean(str(r.parent)!, 200),
+      // Old logs have none of the three (null).
+      sessionId: str(r.session_id) === null ? null : clean(str(r.session_id)!, 200),
+      sessionTitle: str(r.session_title) === null ? null : clean(str(r.session_title)!, 200),
+      project: str(r.project) === null ? null : clean(str(r.project)!, 200),
       pid: pid !== null && Number.isInteger(pid) && pid > 0 ? pid : null,
       // agy is final-only whatever the record says; the others as recorded.
       granularity: run.executor === 'agy' || r.granularity === 'final-only' ? 'final-only' : 'live',
@@ -262,6 +269,7 @@ function mapWrapper(type: string, r: Obj, run: RunSummary): Mapped {
       `started ${executor ?? run.executor}`,
       `model ${patch.model ?? 'executor default'}`,
       patch.label === null ? null : `label ${patch.label}`,
+      patch.sessionTitle ? `from chat ${patch.sessionTitle}` : null,
     ].filter(Boolean)
     return { events: [ev('status', bits.join(' · '), { at })], patch }
   }

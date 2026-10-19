@@ -84,6 +84,56 @@ _runlog_oversize() {
   _runlog_segment_bytes=$((_runlog_segment_bytes + ${#rec} + 1))
 }
 
+# Best effort: the launching Claude Code chat and its project, from a session-id read of the transcript.
+# Sets _runlog_session_id, _runlog_session_title, _runlog_project (empty string = unknown).
+# Never fails, never writes to stdout/stderr, safe under set -euo pipefail.
+# Bounded in work (at most ORCH_RUNLOG_TRANSCRIPT_MAX_BYTES per end) and in time (ORCH_RUNLOG_SESSION_TIMEOUT
+# seconds for both reads, via coreutils timeout); when a bound is hit the fields stay empty (null / workdir).
+_runlog_session() {
+  _runlog_session_id= _runlog_session_title= _runlog_project=
+  local id=${CLAUDE_CODE_SESSION_ID-} dir dirs=() t title= cwd= max secs out
+  if [[ ! $id =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then return 0; fi
+  _runlog_session_id=$id
+  dir=${CLAUDE_CONFIG_DIR:-${HOME:-}/.claude}/projects
+  { for t in "$dir"/*/"$id".jsonl; do [[ -f $t && ! -L $t ]] && dirs+=("$t") && break; done; } 2>/dev/null || true
+  t=${dirs[0]-}
+  if [[ -z $t ]]; then return 0; fi
+  # The lookup is dashboard metadata only: it must never delay the worker.
+  max=${ORCH_RUNLOG_TRANSCRIPT_MAX_BYTES:-8388608}
+  [[ $max =~ ^[1-9][0-9]*$ ]] || max=8388608
+  secs=${ORCH_RUNLOG_SESSION_TIMEOUT:-2}
+  [[ $secs =~ ^([1-9][0-9]*|0\.[0-9]*[1-9][0-9]*|[1-9][0-9]*\.[0-9]+)$ ]] || secs=2
+  # No timeout binary: skip the lookup rather than run it unbounded.
+  command -v timeout >/dev/null 2>&1 || return 0
+  # ponytail: the title is read once at start, so a chat renamed later keeps the old name in this run's record
+  # (upgrade path: the UI re-reads the transcript). Ceiling: only the last ORCH_RUNLOG_TRANSCRIPT_MAX_BYTES of the
+  # transcript are scanned for the title (and only the first for the cwd), so a title/record written earlier in a
+  # huge transcript is not found, and the whole lookup gives up after ORCH_RUNLOG_SESSION_TIMEOUT seconds; the fields
+  # then stay null / workdir.
+  out=$(timeout -k 1 "$secs" bash -c '
+    t=$1 max=$2
+    # title: last max bytes only (tail -c seeks); a partial first line simply does not match a whole record.
+    title=$(tail -c "$max" -- "$t" 2>/dev/null | grep -F "\"type\":\"custom-title\"" 2>/dev/null | tail -n 1 \
+      | jq -r ".customTitle // empty" 2>/dev/null) || title=
+    # \001 terminates each value; a title/cwd never contains it (NUL would be lost in $()).
+    printf "T%s\001" "${title:0:2000}"
+    # cwd: first max bytes only.
+    cwd=$(head -c "$max" -- "$t" 2>/dev/null | grep -m1 -F "\"cwd\":\"" 2>/dev/null \
+      | jq -r ".cwd // empty" 2>/dev/null) || cwd=
+    printf "C%s\001" "${cwd:0:4096}"
+  ' _ "$t" "$max" 2>/dev/null) || out=
+  title= cwd=
+  if [[ $out == T* ]]; then
+    out=${out#T}
+    title=${out%%$'\001'*}
+    out=${out#*$'\001'}
+    if [[ $out == C* ]]; then cwd=${out#C}; cwd=${cwd%%$'\001'*}; fi
+  fi
+  _runlog_session_title=${title:0:200}
+  if [[ $cwd == /* ]]; then _runlog_project=$cwd; fi
+  return 0
+}
+
 _runlog_init() {
   _runlog_initialized=1
   _runlog_executor=$1
@@ -110,12 +160,20 @@ _runlog_init() {
   _runlog_keep=${ORCH_RUNLOG_KEEP_SEGMENTS:-4}
   [[ $_runlog_keep =~ ^[1-9][0-9]*$ ]] || _runlog_keep=4
   workdir=$(cd -- "$3" 2>/dev/null && pwd) || workdir=$3
+  _runlog_session || true
+  # project falls back to the run's resolved workdir when the transcript cannot be read.
+  if [[ -z $_runlog_project ]]; then _runlog_project=$workdir; fi
   jq -nc --arg run_id "$_runlog_id" --arg executor "$1" --arg model "$4" \
     --arg label "${ORCH_LABEL-${2##*/}}" --arg parent "${ORCH_PARENT:-}" \
-    --arg workdir "$workdir" --argjson pid "$$" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" '
+    --arg workdir "$workdir" --argjson pid "$$" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
+    --arg session_id "$_runlog_session_id" --arg session_title "$_runlog_session_title" \
+    --arg project "$_runlog_project" '
     {v:1, type:"orchestrator.start", $run_id, $executor,
      model:($model | select(. != "") // null), label:($label | select(. != "") // null),
      parent:($parent | select(. != "") // null), $workdir, $pid,
+     session_id:($session_id | select(. != "") // null),
+     session_title:($session_title | select(. != "") // null),
+     project:($project | select(. != "") // null),
      granularity:(if $executor == "agy" then "final-only" else "live" end), $ts}' \
     | _runlog_append || true
 }

@@ -51,6 +51,12 @@ export type RunSummary = {
   model: string | null
   label: string | null
   parent: string | null
+  /** The launching Claude Code session (start record `session_id`); null in old logs. */
+  sessionId: string | null
+  /** That chat's title (`session_title`); null when not recorded. */
+  sessionTitle: string | null
+  /** That session's project directory (`project`, else the workdir); null when not recorded. */
+  project: string | null
   pid: number | null
   granularity: Granularity
   startedAt: number
