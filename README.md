@@ -1,36 +1,43 @@
 # SonoranClaudeRouter
 
-Cross-provider visibility for Claude-orchestrated coding agents.
+**Status: Agent Inspector design proposal. No implementation is included.** This repository documents a read-only inspector for the existing Claude Code orchestration skill at `~/.claude/skills/orchestrator`. That skill is not copied into this repository and its execution or routing logic has not been changed.
 
-**Status: design proposal.** This repository contains the Agent Inspector concept, implementation plan, integration research, and mockup. It does not yet contain a working router, monitoring service, or Claude Code mod. The existing orchestration skill described in the project brief has not been imported or audited here.
+## Why build it?
 
-## The problem
+The orchestrator already chooses workers by task complexity and available quota. Claude-native subagents are visible in the desktop app, but Codex, Pi, and agy jobs currently run without useful live transcripts in the parent conversation. Agent Inspector would let the user select an external worker and follow its emitted activity instead of repeatedly requesting status.
 
-The existing workflow uses Claude to delegate work according to task complexity and available usage across Claude, Codex, and OpenRouter-backed workers. Long-running delegates are difficult to inspect without asking the orchestrator for an update.
+## Current execution paths
 
-Agent Inspector would show each worker's actual emitted activity: messages, tool calls, command output, edits, test results, errors, and available usage metadata. It adds visibility to the existing routing workflow rather than replacing its scheduling or model-selection policy.
+| Executor | Existing launch | Visibility to add |
+| --- | --- | --- |
+| Claude | Native Agent tool | Correlate native `agent.spawn` / `$.agent.list()` details inside the pane (later phase). |
+| Codex | One-shot `codex exec` with `-o` result file; stdout discarded | Enable `--json` and tee its JSONL to a per-run log while retaining `-o` and the result contract. |
+| Pi | One-shot `pi -p --mode json`; stdout buffered by the wrapper | Tee the existing JSONL as it arrives; keep the wrapper's final parsing and exit behavior. |
+| agy (Antigravity) | One-shot `agy --output-format json -p=…` | Show start/exit plus final JSON only; no claim of live incremental model output. |
+
+**OpenRouter is not a separate executor here.** Pi uses OpenRouter-hosted models; `usage.sh` also checks OpenRouter credits. agy has separate quota buckets. Model backends, executors, and quota sources must not be conflated.
 
 ## Concept mockup
 
-![Agent Inspector concept: a running-agent list beside a selected worker's live transcript, tool output, file diff, and usage cards.](docs/assets/agent-inspector-mockup.webp)
+![Dark Agent Inspector concept with worker cards, a selected worker transcript, tool output, and usage cards.](docs/assets/agent-inspector-mockup.webp)
 
-*Illustrative, AI-generated design concept, not a screenshot of working software. Model names, timestamps, metrics, code, and test outcomes are fictional. The repository image is a web-optimized preview of the conversation's mockup. See [asset notes](docs/assets/README.md).*
+*AI-generated concept, not an implementation screenshot. The illustration predates agy coverage and contains fictional models, metrics, commands, and test results. Its message composer and model selector are not part of the read-only MVP. See [image notes](docs/assets/README.md).*
 
-The preferred experience is an inspector close to the Claude Code conversation: select a worker and follow its output without repeatedly requesting status. Native panel support is a feasibility gate, not an established dependency. A companion terminal or local browser viewer is the fallback if the installed Claude Code version cannot host the required interface.
+## Minimal proposed solution
+
+The owner's installed Claude Code build (2.1.299) provides a native mod pane via `$.ui.open` and `ui.render` with a `Pane` component. Start from the installed `plugin-authoring` skill's `pane.tsx` example.
+
+1. Each existing **external** worker wrapper writes a private per-run JSONL log under `$XDG_RUNTIME_DIR/orchestrator/`. Codex and Pi can report events before completion; agy is explicitly final-only.
+2. The mod pane polls those files using `$.fs` and `$.clock.every`, shows per-worker activity, and keeps a bounded **in-memory** display buffer with `$.state`.
+3. Later, the pane associates Claude-native workers using `agent.spawn`, `$.agent.list()`, and supported `turn.step` events.
+
+There is **no collector service, socket, browser viewer, persistent ingestion cursor, Pi RPC conversion, or direct OpenRouter streaming adapter** in the proposed MVP. Worker processes remain owned by their existing wrappers. The mod observes them without steering, approving tools, or changing routing.
 
 ## Documentation
 
-| Document | Contents |
-| --- | --- |
-| [Agent Inspector design](docs/AGENT_INSPECTOR_DESIGN.md) | User experience, architecture, event contract, privacy, and scope boundaries. |
-| [Implementation plan](docs/IMPLEMENTATION_PLAN.md) | Ordered milestones, proof requirements, and acceptance checks. |
-| [Integration research](docs/INTEGRATION_RESEARCH.md) | Primary-source references, documented interfaces, and compatibility questions. |
-| [Mockup asset notes](docs/assets/README.md) | Image provenance, checksum, and differences between the illustration and the proposed MVP. |
+- [Small implementation plan](docs/IMPLEMENTATION_PLAN.md): native pane, external runners first, Claude attribution second, then tests.
+- [Design and safety boundaries](docs/AGENT_INSPECTOR_DESIGN.md): UI, log contract, honesty, privacy, and non-interference.
+- [Local integration evidence](docs/INTEGRATION_RESEARCH.md): installed APIs, current wrappers, quota source, and remaining checks.
+- [Mockup asset notes](docs/assets/README.md): committed image and interpretation.
 
-## Proposed first release
-
-A read-only agent list and live transcript viewer, backed by a local collector and adapters around existing worker launch paths. Start with a compatibility spike, then one Claude path and one Codex path before expanding to Pi and other OpenRouter-backed runtimes.
-
-The monitor must not grant permissions, inject prompts, change routing, relaunch workers, or terminate tasks when its UI closes. It must label unavailable information honestly rather than inventing reasoning, completion percentages, or remaining subscription usage.
-
-**Next proposed task:** complete Phase 0 of the [implementation plan](docs/IMPLEMENTATION_PLAN.md). Documentation does not authorize implementation or changes to the existing orchestrator.
+**Next task proposed, not authorized by these documents:** implement the native pane from `pane.tsx` and demonstrate that it opens in the desktop app. Keep the current routing policy intact.

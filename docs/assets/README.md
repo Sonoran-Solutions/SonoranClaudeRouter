@@ -1,25 +1,15 @@
-# Mockup asset notes
+# Agent Inspector mockup asset
 
-## Repository preview
-
-- File: [agent-inspector-mockup.webp](agent-inspector-mockup.webp)
-- Dimensions: 900 x 675 pixels.
-- Format: WebP; resized and compressed from the original conversation image.
+- Committed image: [agent-inspector-mockup.webp](agent-inspector-mockup.webp)
+- Dimensions: 900 × 675 pixels
+- Format: WebP, resized/compressed from the design discussion's source illustration
 - SHA-256: `41e90eb6e7cb2563f2100e49b8a358b6c2688de935f9e277f83aa7a451eb2d0c`
-- Provenance: AI-generated Agent Inspector concept supplied in the project discussion and added at the user's request.
+- Provenance: AI-generated concept added at the owner's request
 
-The preview preserves the same composition and content; it is not a newly generated design. It is used by the README and design document. The original is not included as a repository binary in this documentation change and is provided separately in the accompanying chat.
+This **committed** image is the canonical repository reference. The README and design use its relative path; no external chat attachment is required to view the documentation.
 
-## Original image reference
+The picture is a product concept, not a screenshot of a running mod. Its models, tool output, timestamps, costs, code and test outcomes are fictional examples. The picture predates inclusion of **agy (Antigravity)** in the documented worker roster. Real agy output is **final-only**, not a continuous event transcript.
 
-Original filename: `agent_inspector_live_output_dashboard.png`  
-Dimensions: 1448 x 1086 pixels  
-SHA-256: `c67cd1c2b36d4a1bf5b2758e6ab61dae0f08cda5af697c153649b2fc8199fbd6`
+The illustrated message composer, model selector, and generic `[thought]` labels are *not* MVP requirements. The first release is read-only and must distinguish actual messages, exposed reasoning summaries, tool evidence, and unavailable content.
 
-These values identify the untouched source image for a later full-resolution upload; they are not a download link or a claim that the PNG already exists in this repository.
-
-## Interpretation
-
-This is a concept illustration, not evidence of a working integration. All model names, metrics, runtime values, timestamps, code samples, and test results in the image are illustrative. Its desktop navigation and window chrome do not establish native Claude Code UI support.
-
-The generic `[thought]` labels should become source-specific message/reasoning labels in the implementation. The bottom message composer and model selector are outside the read-only MVP and should be hidden or disabled. See the [design](../AGENT_INSPECTOR_DESIGN.md) for the intended scope.
+See the [minimal design](../AGENT_INSPECTOR_DESIGN.md).

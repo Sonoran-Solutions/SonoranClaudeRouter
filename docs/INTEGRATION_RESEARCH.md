@@ -1,56 +1,47 @@
-# Integration research and compatibility notes
+# Integration evidence and references
 
-Checked: 2026-10-19  
-Scope: primary-source documentation review, not an installed-runtime test
+Date: 2026-10-19  
+Scope: documentation adjusted to the [owner-machine review of PR #1](https://github.com/Sonoran-Solutions/SonoranClaudeRouter/pull/1#issuecomment-6272603341), not a fresh test performed by this repository.
 
-The original discussion proposed a native Claude Code mod. This research supports structured observation paths, but does **not** establish that the installed Claude Code build provides the exact sidebar or `turn.step` API assumed in that discussion. Keep native hosting behind the Phase 0 gate. Failure to verify an API here is not proof that no such API exists.
+## Native Claude Code mod API: established on installed build
 
-## Documented interfaces
+The review inspected local Claude Code **2.1.299** mod/plugin type definitions:
 
-### Claude Code hooks
+- `$.ui.open({ id, title })` and `ui.render` with `{ component: 'Pane' }` create a native UI pane.
+- `turn.step` is an actual streaming event; `agent.spawn` covers the Agent tool, and `$.agent.list()` exposes live agent IDs/models.
+- `$.process.spawn` can stream subprocess chunks, but taking over wrapper process ownership is **not needed** for the proposed file-tail design.
+- `$.state` / `$.store` are available for session/global mod state, and `$.fs` plus `$.clock.every` are the proposed local-file polling path.
 
-The [official hooks reference](https://code.claude.com/docs/en/hooks) documents subagent lifecycle and tool events. `SubagentStart` identifies an agent; `SubagentStop` can include its transcript path and final-message metadata. These are useful correlation inputs, not proof of a complete live transcript. Hook handlers must remain observational and must not return permission decisions or instructions that alter the run.
+**Action:** build from the installed `plugin-authoring/pane.tsx` example and verify desktop rendering. Native panel availability is **not** an open feasibility gate. The event payloads and actual file-tail performance still require implementation tests.
 
-### Programmatically launched Claude Code
+## Current router: already located
 
-The [official programmatic-use guide](https://code.claude.com/docs/en/headless) documents `stream-json`, verbose output, partial messages, and forwarding subagent text. It describes `parent_tool_use_id` for associating nested messages and version-dependent forwarding behavior. Some invocation paths deliver messages only after completion.
+The active orchestration skill lives at `~/.claude/skills/orchestrator`. These are current local findings from the review, not claims derived from repository code (the repo only contains this proposal):
 
-For an authorized compatibility experiment, the documented stream-related flags include:
+| Executor | Current command shape | What needs to change |
+| --- | --- | --- |
+| Claude | Native Agent tool | Later correlate existing IDs/events; no separate launcher |
+| Codex | One-shot `codex exec … -o <file>`, stdout discarded | Add `--json` and tee JSONL without replacing `-o` result |
+| Pi | One-shot `pi -p --mode json`, JSONL buffered in shell variable | Tee existing JSONL and preserve post-exit parsing |
+| agy / Antigravity | One-shot `agy --output-format json -p=…` | Emit start/exit metadata and final-only result |
 
-```text
---output-format stream-json --verbose --include-partial-messages
---forward-subagent-text
-```
+The existing `usage.sh` checks Codex rate limits through `codex app-server account/rateLimits/read`, agy quotas through `/quota` and `/credits`, OpenRouter through `/api/v1/credits`, and Claude usage through `mcp__ccd_session_mgmt__get_usage` in the desktop app. agy has its **own quota buckets**. These quota queries are not evidence that a direct OpenRouter worker loop exists.
 
-These are candidate flags, not a replacement launch command. Verify support locally and preserve the existing worker's authentication, settings, permissions, and result-return contract. A programmatic stream does not itself prove that an existing interactive session can be attached to without changes.
+Pi is used with **OpenRouter** in this setup. OpenRouter is a provider/credits source, **not** a fifth executor or independent live-event adapter.
 
-### Codex
+## Technical references and what they do *not* imply
 
-The [official non-interactive guide](https://developers.openai.com/codex/non-interactive-mode) documents `codex exec --json`, which emits JSONL lifecycle and item events. It is a candidate for one-shot workers, not a guarantee that every nested command's output arrives token by token.
+- [Codex non-interactive JSON mode](https://developers.openai.com/codex/non-interactive-mode) documents `codex exec --json`. Confirm emitted event granularity with the installed CLI; do not infer token-level tool output.
+- [Codex app-server](https://developers.openai.com/codex/app-server) documents richer streaming APIs but is currently used for quota lookup, **not** to launch this router's workers. No app-server executor migration is planned.
+- [Pi RPC reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md) describes a **different persistent mode**. It is background research only; the active wrapper uses `--mode json` and remains one-shot.
+- [Claude Code hooks](https://code.claude.com/docs/en/hooks) and [programmatic mode](https://code.claude.com/docs/en/headless) are supplementary references; the native installed mod API and Agent tool already address this project's Claude path.
+- [OpenRouter streaming](https://openrouter.ai/docs/api/reference/streaming) is not a direct integration requirement because the model calls run through Pi.
 
-The [official app-server reference](https://developers.openai.com/codex/app-server) documents a richer session interface, including message and command-output deltas, reasoning-summary events, and approval requests. Availability of readable reasoning depends on the model. Preserve opaque data as opaque; do not reconstruct hidden reasoning. A read-only viewer must not become an approval handler by accident.
+## Still to prove during implementation
 
-### Pi
+1. The real mod pane opens and updates on the owner's desktop build, and polling `$.fs` does not block UI.
+2. Codex and Pi emit useful JSONL **before process completion** with the current authentication/flags.
+3. Tee/log failures cannot alter the original wrapper's exit code, `-o` output, Pi extraction, or worker lifetime.
+4. agy displays explicitly as **final-only** and every source keeps accurate task/usage attribution.
 
-The [maintainer's RPC reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md) documents a persistent subprocess controlled through JSONL, asynchronous responses, and session events. It requires continuous stdout consumption and separates diagnostics onto stderr. Command acceptance is not task completion; the documented `agent_settled` boundary differs from the lower-level `agent_end` event.
-
-This page redirected from the earlier `badlogic/pi-mono` repository location during research. Check the installed CLI and its matching documentation rather than assuming names or event contracts from an older release. The design has not yet been tested against the user's Pi version.
-
-### OpenRouter
-
-The [official streaming reference](https://openrouter.ai/docs/api/reference/streaming) documents streamed API responses. The [reasoning reference](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens) describes provider/model-dependent reasoning handling. An adapter should expose only readable fields actually returned and tolerate absent, summarized, or opaque reasoning.
-
-OpenRouter is an API/provider layer, not by itself a local coding-agent runtime. Tool execution and filesystem changes must be observed from the harness that performs them. A Pi-to-OpenRouter task normally needs one Pi adapter, not a second duplicate transcript.
-
-## Findings that remain unverified
-
-| Question | Required proof |
-| --- | --- |
-| Native Claude Code panel support | Installed-version documentation and a minimal panel that opens, updates, and closes without affecting the session. |
-| Exact existing router integration | Inspect the actual orchestration skill and launcher contracts; none were present in this initially empty repository. |
-| Live Claude-native text capture | Observe a real subagent before completion and verify parent/child IDs. |
-| Fine-grained Codex output | Demonstrate the exact chosen integration's live event categories; do not infer them from the normal chat UI. |
-| Quota availability | Identify the router's approved source, update cadence, and scope. Do not infer subscription allowance from API-token usage. |
-| Runtime compatibility | Record local versions, authentication paths, permission behavior, and sanitized event fixtures. |
-
-This file intentionally does not recommend third-party mods from the earlier discussion as verified dependencies. Evaluate their actual code, maintenance, and permissions separately before adoption.
+No collector, Unix socket, browser security layer, direct API adapter, persistent Pi RPC loop, or unverified alternative hosting remains in the proposed implementation.

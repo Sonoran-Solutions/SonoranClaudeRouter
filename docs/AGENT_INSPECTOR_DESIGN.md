@@ -1,160 +1,66 @@
-# Agent Inspector design
+# Agent Inspector: minimal design
 
 Date: 2026-10-19  
-Status: proposed design; implementation not started
+Status: proposal only; no runtime implementation
 
-## 1. Purpose and brief
+## 1. Purpose and scope
 
-Make delegated coding work inspectable while it happens. The user already has a Claude Code orchestration skill that selects workers using task complexity and available usage. The missing capability is a direct view into those workers, comparable to following an ordinary coding-agent conversation.
+Give the owner a direct, read-only view of delegated work without asking Claude for updates. The immediate blind spots are the **one-shot Codex and Pi wrappers**, followed by the **agy final-only runner**. Claude-native subagents already have some visibility in the desktop app, so their attribution comes after external runners.
 
-The discussion establishes the need for live visibility, mixed-provider support, and the supplied visual direction. The specific architecture, milestone order, and acceptance thresholds below are proposals, not separately approved owner decisions.
+The current router remains at `~/.claude/skills/orchestrator`; no change to task selection, quota policy, permissions, worker ownership, cancellation, or final-result contracts is proposed.
 
-Success means the user can answer, without prompting the orchestrator:
+## 2. Visual reference and native hosting
 
-- Which workers are active, what were they assigned, and what spawned them?
-- What did a selected worker most recently say, run, edit, or report?
-- Is it working, waiting for input, retrying, finished, or simply no longer observable?
+![Agent Inspector concept illustration](assets/agent-inspector-mockup.webp)
 
-## 2. Visual direction
+The image is a visual direction, not a working screenshot. It shows Claude, Codex, and Pi but predates **agy**; the real worker list must include agy. Hide/disable the concept's message composer and model selector. The mockup's generic “thought” lines must never be presented as raw private reasoning.
 
-![Agent Inspector concept with worker cards and a selected worker's live output.](assets/agent-inspector-mockup.webp)
+The owner's Claude Code **2.1.299** mod definitions include `$.ui.open({ id, title })` and a `ui.render` hook with a `Pane` component. Use the installed `plugin-authoring/pane.tsx` example to build the native pane; a separate browser or terminal frontend is not in scope. `$.state` supports session-local UI data. The installed API also exposes `turn.step`, `agent.spawn`, `$.agent.list()`, and streaming `$.process.spawn`; the first implementation does **not** need to take over worker process spawning.
 
-The mockup is a visual reference, not an implementation contract. It depicts a desktop-style shell; the production layout must adapt to the actual host's capabilities and available terminal width.
+The pane should offer a worker list and selected transcript with executor, model if reported, task label, run age, last event, state, stream granularity, and exit/result details. Support follow-tail versus manual scrolling, bounded output expansion, and keyboard navigation. Quiet does not mean stalled; unknown does not mean failed.
 
-### Agent list
+## 3. Existing execution boundaries
 
-Show task title, harness, provider, model, parent task, runtime, lifecycle status, and time since the last observed event. Distinguish the harness from the provider: a Pi worker can use an OpenRouter-hosted model. Group workers by orchestration session so simultaneous projects do not mix.
+| Runner | Source today | Proposed observation | Honest limitation |
+| --- | --- | --- | --- |
+| Codex | One-shot `codex exec -o <result-file>`, stdout discarded | Add `--json`; tee stdout JSONL to one per-run file; continue reading the existing `-o` result | Item/event granularity depends on actual CLI stream |
+| Pi | One-shot `pi -p --mode json` captured in a shell variable | Tee existing JSONL as it is produced, then preserve today's result extraction | **Not RPC mode**; OpenRouter is Pi's model provider |
+| agy | One-shot `agy --output-format json -p=…` | Write start/exit metadata; wrap the completed final JSON into a single JSONL record | **Final-only**, not continuous model output |
+| Claude-native | Agent tool | Later use `agent.spawn` / `$.agent.list()` IDs and `turn.step` observation as supported | Show only actually exposed content; no transcript scraping requirement |
 
-Selecting a worker opens its transcript without losing the parent conversation. Keep completed and failed workers available in session history. Preserve selection and scroll position when another worker emits an event.
+Quota metadata already comes from the router's `usage.sh`. Its sources include Codex app-server rate limits, agy quota/credits, OpenRouter credits, and Claude session-management usage. Label different quota buckets and measurement ages. Do not pretend token counts are remaining subscription quota. **No direct OpenRouter agent/API loop exists** to instrument.
 
-### Live transcript
-
-Render messages, tool invocations, tool results, command output, reported file changes, and errors as distinct event types. Offer follow-tail, pause-follow, search, filtering, expandable output blocks, and a full-log view. Pausing follow only pauses scrolling, never the worker or event collection.
-
-Provide keyboard navigation and textual status labels; do not rely on color alone. Fit a compact view into a narrow terminal and avoid taking over the orchestrator's existing shortcuts. Exact keybindings depend on the selected host.
-
-### Reasoning and evidence labels
-
-Use labels such as `message`, `reasoning summary`, and `exposed reasoning`, according to what the source actually provides. Never infer private reasoning from tool activity or promise complete internal thinking. Encrypted or opaque reasoning data is not display text. Missing reasoning should read as unavailable, not an empty loading panel.
-
-The mockup's generic `[thought]` label must be replaced by these source-specific labels. Its test-pass line is illustrative; in the product, a worker's claimed outcome and a tool's captured exit status are separate pieces of evidence. A successful worker run is not the same as owner acceptance or a completed code review.
-
-### Metrics and freshness
-
-Show observed tool counts and elapsed time. Display token usage and cost only when supplied or derived from a documented source. Mark estimates, specify their scope, and timestamp them. Do not add a cumulative session total to per-turn totals and double-count usage.
-
-Subscription quota, monetary API spend, context consumption, and token counts are different measurements. Reuse the existing router's approved quota source where available, displaying its age. Do not infer remaining Claude/Codex allowance from token counts or show missing data as zero.
-
-Display worker lifecycle and telemetry freshness separately. A quiet worker is not necessarily stuck. The UI may say `No events for 3m` while the last known lifecycle remains `running`; loss of observation must not manufacture a failure or success.
-
-### Excluded mockup controls
-
-The message composer and provider/model selector in the illustration are future concepts. Hide or visibly disable them in a read-only release. No steering, cancellation, permission approval, or model switching belongs in the MVP.
-
-## 3. Proposed architecture
+## 4. Minimal data flow
 
 ```text
-Existing Claude orchestrator and routing policy
-                    |
-      Existing worker owner / instrumented launch boundary
-                    |
-     +--------------+---------------+----------------+
-     |                              |                |
- Claude adapter                Codex adapter    Pi / API adapter
-     |                              |                |
-     +----------- normalized observation events -----+
-                                    |
-                     Local collector and bounded store
-                                    |
-                     Read-only subscription / replay
-                                    |
-              Claude Code inspector, if host support is proven
-                or companion terminal / local browser viewer
+~/.claude/skills/orchestrator
+  ├─ Claude Agent tool ──────────> native agent events (Phase 2)
+  ├─ Codex one-shot wrapper ─┐
+  ├─ Pi one-shot wrapper ────┼──> $XDG_RUNTIME_DIR/orchestrator/<run-id>.jsonl
+  └─ agy one-shot wrapper ───┘                   │
+                                         native Claude Code mod
+                                      $.fs + $.clock.every polling
+                                          Pane + $.state buffer
 ```
 
-**Keep execution ownership where it already lives.** The orchestrator or current supervisor remains responsible for worker stdin/stdout, permissions, cancellation, and process lifetime. The monitor receives an observation copy. Closing the viewer must not close a worker's input or send a termination signal.
+Each external run receives a unique filename and a small namespaced start record with a run ID, executor, task label, and timestamp. Keep the provider's emitted JSONL records intact where possible. Add a namespaced exit record containing the **original worker exit status**; for agy, include a final-only result record once its command exits. Record a parent task or session ID only when the wrapper already has or is explicitly passed that identifier; otherwise display “not available”, not an invented relationship.
 
-The launch boundary assigns correlation IDs before work starts and registers the actual session/process identifiers when available. It also records a short routing reason and the quota snapshot used by the existing router, without changing that router's decisions.
+A file contains complete newline-delimited JSON records. The mod reads newly appended complete lines and waits on partial trailing lines. It tracks reading position and a bounded display buffer in `$.state`; **there is no durable collector, ingestion cursor, database, subscriber replay, socket, or network service**. The per-run files themselves are the local session record, subject to cleanup. Parser errors become visible telemetry warnings and must not be mistaken for agent failures.
 
-Provider adapters translate supported source events into a shared envelope while retaining useful source-specific fields. Capture should use structured streams rather than scraping an interactive terminal whenever possible. Do not launch a duplicate agent merely to obtain a second view of the same task.
+Codex must retain its `-o` file output. Pi must retain its final parsing semantics. Instrumentation must not turn a successful run into a failure or a failed run into success, including when logging fails. Preserve the worker's own exit code across tee/pipeline handling and ensure the stream keeps draining even if the telemetry destination becomes unwritable. Do not add a second model invocation just to monitor one.
 
-The collector owns ingestion, validation, redaction, persistence, and subscriber replay. A single writer with an append-only JSONL log is a reasonable initial implementation; an indexed store can follow demonstrated search needs. Storage format and implementation language remain open until the existing skill's integration points have been inspected.
+## 5. Trust, retention, and UI honesty
 
-The frontend depends on the normalized protocol, not provider-specific subprocess handling. That separation leaves room for a later Sonoran Hub frontend without making Hub integration part of this project phase.
+Create the runtime directory with owner-only access (mode `0700`) and logs with mode `0600` (for example using `umask 077`). Do not create a world-readable fallback if `$XDG_RUNTIME_DIR` is absent. Never commit real logs, prompts, tokens, credentials, or quota snapshots into this public repository. Raw provider output may still contain secrets: minimize logged fields, redact known secrets before writing where feasible, redact before rendering, and clean up completed logs on a defined local retention policy. File permissions are necessary, not sufficient.
 
-## 4. Adapter boundaries
+Treat output as **untrusted text**: escape rich markup, strip unsafe terminal control characters, never execute transcript text, and do not let file names choose arbitrary read paths. Store only a bounded number of recent rendered events per worker in session state; show that older displayed events were omitted instead of implying complete coverage.
 
-See [integration research](INTEGRATION_RESEARCH.md) for primary sources and compatibility caveats.
+Display `reasoning summary` or `exposed reasoning` only if supplied as readable content. Do not synthesize “thinking” from tool calls. Distinguish worker-reported success, observed process exit status, and independently verified tests. agy must say `final-only`, even while running; last-event timestamps are observation freshness, not progress percentages.
 
-| Path | Proposed capture strategy | Boundary to prove |
-| --- | --- | --- |
-| Claude-native subagents | Documented lifecycle/tool hooks; supported stream or scoped transcript access for content. | Correct parent/child attribution and visibility during execution, not just at completion. |
-| Separately launched Claude worker | Programmatic structured output from the existing launcher. | Preserve its authentication, settings, permissions, result contract, and nested-worker behavior. |
-| Codex worker | Start with the existing supported structured integration; `exec --json` is a lightweight candidate. | Determine which items arrive live and which are buffered. Use app-server if required for finer output deltas. |
-| Pi worker | Existing JSON event or RPC mode, depending on how it is currently launched. | Respect asynchronous command responses, actual run completion, framing, and continuous stream draining. |
-| OpenRouter-backed worker | Observe the harness first; add direct API streaming only when the router itself owns that API loop. | API text/tool-call requests are not proof that a local tool executed. Observe local execution separately. |
+The mod is read-only: it must not register a `tool.call` handler that denies or approves work, rewrite `prompt.submit`, steer workers, switch models, or send cancellation signals. Closing the pane must leave execution and result return unchanged. If the log path is unavailable or malformed, only monitoring degrades.
 
-Hooks alone do not establish access to every live message. A hook can provide lifecycle information while transcript content is delayed. Native UI support must be proven separately from event capture. Do not depend on an assumed `turn.step` event or arbitrary sidebar API without an installed-version demonstration.
+## 6. Deferred
 
-## 5. Proposed event contract
+Interactive messaging/cancellation, persistent Pi RPC, Codex app-server as an executor, direct OpenRouter streaming, remote access, Sonoran Hub integration, and a collector service are not part of the minimal implementation. Reconsider any of them only after observed limitations justify the extra architecture.
 
-The following is an illustrative envelope, not a published provider schema:
-
-```json
-{
-  "schema_version": 1,
-  "event_id": "evt-example-018",
-  "session_id": "session-example",
-  "task_id": "task-roster",
-  "worker_id": "worker-codex-01",
-  "attempt_id": "attempt-01",
-  "parent_worker_id": null,
-  "source_sequence": 18,
-  "observed_at": "2026-10-19T16:14:28Z",
-  "harness": "codex",
-  "provider": "openai",
-  "model": null,
-  "kind": "tool.output.delta",
-  "payload": {
-    "tool_call_id": "tool-test-01",
-    "stream": "stdout",
-    "text": "42 tests passed\n"
-  }
-}
-```
-
-The collector assigns a persistent ingestion cursor for replay. Preserve source sequence and source timestamps when provided; ingestion order across independent workers does not imply causal order. Associate text deltas and final snapshots with stable item IDs, so reconnecting does not duplicate the same output.
-
-Use separate logical worker and attempt IDs. Retries or resumed invocations may reuse a provider session but must not overwrite the previous attempt's history. Scope all lookup keys to their orchestration session.
-
-Candidate event families are `worker.*`, `message.*`, `reasoning.*`, `tool.*`, `artifact.reported`, `usage.reported`, and `telemetry.*`. Each adapter declares its supported families and whether capture is live, buffered, or summary-only. Unknown or malformed provider records generate diagnostics, not invented task results.
-
-Candidate lifecycle states are `queued`, `starting`, `running`, `waiting_input`, `retrying`, `succeeded`, `failed`, `cancelled`, and `unknown`. Do not equate a turn completion with worker completion for a persistent session. Apply the adapter's verified terminal condition and retain exit status separately when a process exists.
-
-## 6. Reliability and non-interference
-
-The worker owner must continuously drain its protocol streams independently of UI rendering or disk writes. Use a bounded telemetry queue, batch updates, virtualize long transcripts, and place limits on event size and retention. A slow subscriber must not stall the provider subprocess.
-
-When observation capacity is exceeded, emit a visible telemetry-gap marker and retain the best available lifecycle metadata. Avoid silent loss. If the collector cannot persist a gap immediately, report it when storage recovers. The worker's authoritative result channel remains separate from the lossy observation copy.
-
-Parser errors, collector crashes, disk-full conditions, and viewer disconnects must degrade monitoring, not trigger permission changes, retries, or worker termination. This is a testable design goal, not a claim of zero overhead.
-
-Reconnect using the last durable cursor. Detect an expired cursor and request an explicit history snapshot rather than pretending replay was complete. Show incomplete final records, unavailable history, and unknown process outcomes honestly after crashes.
-
-## 7. Privacy and security
-
-Keep telemetry local by default, outside source repositories. Never commit real transcripts, credentials, auth files, or environment dumps to this public repository. Use synthetic fixtures for development and tests.
-
-Prefer a local Unix-domain socket with per-user access controls. A browser frontend would require loopback binding, authentication, origin checks, and safe handling of local file references; do not expose an unauthenticated network listener. These are requirements to implement and test, not existing protections.
-
-Allowlist useful fields and redact secrets before persistence or display, including retained provider payloads. Redaction is imperfect, so also minimize capture, restrict local file permissions, and make retention/deletion configurable. Raw unredacted capture is outside the MVP.
-
-Treat every transcript and tool result as untrusted text. Escape rendered content, strip unsafe terminal control sequences, reject path traversal in artifact access, and never execute commands embedded in a log. A transcript must not automatically become instructions to another agent.
-
-No new model calls are required to summarize status in the MVP. Event-driven activity labels avoid consuming usage merely to learn how much usage a worker is consuming.
-
-## 8. Open decisions
-
-Before implementation, inspect the current orchestration skill and identify its real launch/return contracts. Confirm supported Claude Code UI APIs and installed versions; choose the initial frontend and first Claude adapter path; establish retention limits; and identify an approved source for quota metadata.
-
-Future write controls need a separate design for ownership, approval routing, interrupted turns, and cancellation. Do not enable them simply because a provider exposes a command or the mockup contains an input box.
+See [implementation plan](IMPLEMENTATION_PLAN.md) for the abbreviated phase sequence and [integration notes](INTEGRATION_RESEARCH.md) for the owner-machine review evidence.

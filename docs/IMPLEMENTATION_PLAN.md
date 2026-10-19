@@ -1,73 +1,42 @@
-# Agent Inspector implementation plan
+# Agent Inspector: small implementation plan
 
 Date: 2026-10-19  
-Status: proposed, not implementation authorization
+Status: proposed tasks, not implementation authorization. No phases have started.
 
-All milestones are unstarted. Use separate reviewable changes and record actual evidence. A passing documentation review does not establish runtime compatibility.
+This plan supersedes the larger collector-and-adapters proposal. The current launcher contracts and native mod API were identified in the [owner-machine review](https://github.com/Sonoran-Solutions/SonoranClaudeRouter/pull/1#issuecomment-6272603341). Preserve existing orchestration policy and worker result/exit semantics.
 
-## Phase 0: compatibility and launch-boundary spike
+## Phase 0 — native pane skeleton
 
-Inspect the existing orchestrator skill locally with owner authorization. Document how it starts Claude, Codex, Pi, and OpenRouter-backed tasks; where process ownership lives; how results return; and which component supplies usage availability. Do not publish private prompts, quota values, credentials, or local auth paths.
+Use the installed Claude Code 2.1.299 `plugin-authoring` skill's `pane.tsx` example. Open a read-only `Pane` with `$.ui.open` and `ui.render`, render a synthetic worker list, then prove that it opens and updates in the owner's desktop app. No alternate browser/terminal UI or interface-feasibility study.
 
-Record installed versions and exact supported interfaces. Demonstrate a minimal supported Claude Code panel if one exists. If not, document the limitation and propose a companion terminal/browser viewer without patching Claude Code internals. Keep UI hosting and event capture as separate findings.
+**Gate:** pane smoke test with version, screenshot, and proof that closing it does not change the parent session.
 
-For one Claude path and one Codex path, run a small owner-approved task that emits at least two separated updates. Capture timestamped, sanitized evidence that the viewer receives an update before the task finishes. Determine which tool output is buffered. Confirm that the same task still returns its normal final result to the orchestrator.
+## Phase 1 — external runners first
 
-**Exit gate:** a short compatibility report, sanitized source-event samples, the chosen frontend, a worker ownership diagram, and known gaps. No migration of the routing policy. No broad implementation until this gate is reviewed.
+Edit only the existing one-shot wrappers at `~/.claude/skills/orchestrator`:
 
-## Phase 1: read-only vertical slice
+- **Codex:** add `--json` to `codex exec`, tee stdout JSONL into `$XDG_RUNTIME_DIR/orchestrator/<run-id>.jsonl`, and retain `-o` plus the existing final return behavior.
+- **Pi:** tee the existing `pi -p --mode json` stream rather than buffering it invisibly; keep the current final parsing. **Do not switch to RPC**. Its model traffic uses OpenRouter through Pi.
+- **agy:** retain `agy --output-format json`. Emit run metadata while active and one final JSONL result only after completion; label it **final-only**.
 
-Implement the minimal event envelope, one adapter, local collector, bounded persistence, and worker selector with a transcript view. Prefer the Claude path proven in Phase 0, but use recorded synthetic fixtures while building the renderer.
+Build the pane's `$.fs` / `$.clock.every` polling view for these per-run files. Keep a bounded recent-event display in `$.state` and handle incomplete trailing lines and corrupt JSON visibly. Ensure start and end markers use unique run IDs, original exit statuses, private directory/file permissions (`0700`/`0600`), and explicit unavailability if logging fails.
 
-Support lifecycle states, last-event age, follow/pause-follow, basic output expansion, final results, and connection health. Keep provider-specific parsing out of the view. Close and reopen the viewer while a worker continues running.
+**Gate:** Codex and Pi show at least one genuine event **before** their one-shot process exits; agy shows honest start/final-only status. Compare normal output, final result, and exit code with monitoring disabled. Inject an unwritable log destination and verify the worker still finishes normally.
 
-**Exit gate:** one real worker can be followed while active, its final state remains inspectable, and restarting the UI does not interrupt execution or create duplicate transcript items.
+## Phase 2 — Claude-native attribution
 
-## Phase 2: Codex integration and correlation
+Add `agent.spawn` and `$.agent.list()` worker IDs and parent/task links to the same pane, using `turn.step` only for content it actually exposes. Do not duplicate native transcripts or invent unavailable reasoning. Display existing `usage.sh` quota data separately with a source timestamp, only if doing so does not invoke new model calls.
 
-Add the proven Codex source. Retain the existing launcher where possible; do not silently replace an interactive or persistent integration with a one-shot `exec` process. Use app-server only when its additional streaming/session capabilities are needed and its integration cost is justified.
+**Gate:** simultaneous Claude, Codex, and Pi work remains correctly attributed to separate runs; missing source fields are labelled unavailable.
 
-Run Claude and Codex workers concurrently under one parent task. Verify that tool output, usage, and terminal outcomes never cross between workers. Record capture granularity visibly: streamed text, streamed command output, item-level updates, or final-only data.
+## Phase 3 — hardening and owner acceptance
 
-**Exit gate:** both worker types display real activity concurrently, preserve their existing result contracts, and remain correctly attributed across retries and reconnects.
+Test concurrent sessions, two workers with the same task name, partial/malformed records, file permission errors, a long-running noisy worker, and closing/reopening the pane. Check bounded UI memory, safe rendering of hostile terminal text, private log permissions, and clearly distinguish event silence from worker failure.
 
-## Phase 3: Pi and OpenRouter coverage
+**Gate:** one evidence report with installed versions, exact wrappers, before/after result equivalence, live-event screenshots/timestamps, known final-only/streaming limits, checks run/not run, and owner approval.
 
-Add the Pi adapter using the installed version's documented event/RPC definitions. Distinguish command acceptance from run completion and correctly handle automatic retry or continuation. For OpenRouter through Pi, reuse the Pi adapter rather than observing and counting the same event twice.
+## Not in scope
 
-Add a direct OpenRouter streaming adapter only if the current router owns a direct API loop. Capture both model events and the host's actual tool-execution events. Do not display a model-issued tool-call request as a completed command.
+No collector, socket, browser viewer, persistent ingestion cursor, direct OpenRouter adapter, persistent Pi RPC, process relaunch, model switching, prompt steering, permission approvals, or cancellation. These add complexity without solving the immediate blind spot.
 
-**Exit gate:** a capability table for every supported launch path, tests for unsupported reasoning fields and missing usage, and one sanitized live demonstration per implemented adapter. Unsupported paths stay explicit.
-
-## Phase 4: reliability and daily-use acceptance
-
-Harden replay, retention, search, filtering, large-output handling, and crash recovery. Reuse approved usage metadata with source timestamps and clear scope. Use an actual long-running task for a soak test after fixture-based failure testing.
-
-**Exit gate:** the acceptance matrix below is completed with evidence, and the owner confirms that routine status requests are no longer needed for supported tasks.
-
-## Acceptance matrix
-
-| Check | Required evidence |
-| --- | --- |
-| Live, not completion-only | At least one update appears before task completion, with source and receive timestamps. Label any buffered event categories. |
-| Update latency | Proposed target: 95% of normal-sized events render within one second of adapter receipt on the test machine. Measure separately from provider buffering. |
-| Correct attribution | Two sessions with similarly named concurrent workers, nested tasks, and retries show no cross-contamination. |
-| Replay | Disconnect/reconnect preserves order and avoids duplicated deltas or final messages. Expired cursors report missing history. |
-| Honest status | Waiting, retrying, failed, cancelled, quiet, and disconnected cases remain distinguishable. No inferred success after losing a process. |
-| Normal execution | Monitoring off versus on preserves launcher arguments, permissions, final-result shape, and exit behavior in controlled fixtures. |
-| Viewer independence | Closing the viewer leaves workers running and returning results normally. |
-| Resource limits | High-volume output and slow consumers keep telemetry memory bounded; dropped observation data is marked. |
-| Failure isolation | Collector unavailable, disk full, malformed JSON, partial records, and adapter exceptions do not deadlock or terminate workers. |
-| Security | Synthetic secrets are removed; malicious terminal sequences and HTML are inert; unauthorized local clients cannot read telemetry. |
-| Usage accuracy | Missing values remain unavailable; estimates have scope/source; cumulative and per-turn figures are not double-counted. |
-| Read-only boundary | No UI path can approve tools, send prompts, switch models, cancel work, or bypass routing policy. |
-
-Acceptance thresholds are proposed targets, not benchmark results. Choose the supported concurrency and retention limits during Phase 0 and report the test environment alongside measurements.
-
-## Deferred work
-
-Interactive steering, cancellation, permission prompts, remote access, a Sonoran Hub frontend, and advanced routing analytics require separate authorization and design. They are not prerequisites for useful observability.
-
-## Review handoff
-
-For each implementation PR, report the base/head commits, actual adapter versions, checks run, checks not run, known buffering or compatibility limits, and evidence paths. Use synthetic or sanitized artifacts only. Keep the PR unmerged unless the owner authorizes merging; do not enable auto-merge as part of implementation.
+**Merge policy:** implementation PRs remain unmerged, with auto-merge off, until explicitly approved. This documentation PR does not authorize wrapper changes.
