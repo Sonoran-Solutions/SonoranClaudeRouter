@@ -3,8 +3,11 @@
 // over the Claude-native agents `agent.spawn` / `$.agent.list()` expose.
 //
 // Read-only by construction: it hooks session.start, command.run (its own
-// command), agent.spawn (observe only, pass-through) and ui.render (its own
-// pane). It never writes files, spawns processes, steers, cancels or gates.
+// command), skill.prompt (opens the pane for /orchestrator; the skill text is
+// untouched), agent.spawn (observe only, pass-through) and ui.render (its own
+// pane). It never writes files, steers, cancels or gates. The one process it
+// runs is the orchestrator's read-only status script usage.sh (via
+// $.process.run, only while the pane is placed) for the Usage section.
 import { atom, read, update } from 'claude-code'
 import type {
   AgentInfo,
@@ -23,6 +26,10 @@ import type {
   InspectorView,
   RunEvents,
   RunSummary,
+  ScriptUsage,
+  UsageRow,
+  UsageState,
+  UsageWindow,
 } from '../types'
 import type { ListedFile, ListedRun } from './reader'
 import { advanceRunFiles } from './reader'
@@ -48,6 +55,11 @@ const TITLE = 'Agent Inspector'
 const POLL_MS = 1000
 /** No new line for this long reads "quiet", which is not "stalled". */
 const QUIET_MS = 30_000
+// ponytail: fixed 5-minute cadence and a hardcoded script path. Ceiling: a user
+// with another skills dir or a different cadence edits these two constants;
+// upgrade path is a userConfig field (plugin.json) read with $.settings.
+const USAGE_REFRESH_MS = 5 * 60_000
+const USAGE_SCRIPT = '.claude/skills/orchestrator/scripts/usage.sh' // under $HOME
 
 const RUNS = atom({ plugin: 'agent-inspector', key: 'runs' } as const, [])
 const CLAUDE = atom({ plugin: 'agent-inspector', key: 'claude' } as const, [])
@@ -61,6 +73,14 @@ const STATUS = atom({ plugin: 'agent-inspector', key: 'status' } as const, {
   detail: null,
   polledAt: null,
   dropped: [],
+})
+const USAGE = atom({ plugin: 'agent-inspector', key: 'usage' } as const, {
+  claude: [],
+  script: null,
+  updatedAt: null,
+  attemptedAt: null,
+  isRefreshing: false,
+  error: null,
 })
 const EVENTS = { plugin: 'agent-inspector', key: 'events' } as const
 
@@ -85,6 +105,7 @@ async function poll($: $): Promise<void> {
     if (!panes.some(pane => pane.id === PANE && pane.isPlaced)) return
     const now = await $.clock.now()
     await refreshClaude($, now)
+    await refreshUsage($, now)
     await pollRunLogs($, now)
   } catch (error) {
     // Monitoring degrades; nothing else is touched.
@@ -93,6 +114,98 @@ async function poll($: $): Promise<void> {
   } finally {
     isPolling = false
   }
+}
+
+// ---------------------------------------------------------------------------
+// Usage: Claude's windows every tick (free); usage.sh (10-70 s) in the
+// background, at most once at a time, never while the pane is not placed.
+
+let isUsageRunning = false // ponytail: per-environment guard, like isPolling.
+
+const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+const obj = (v: unknown): Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+const time = (v: unknown): number | null => {
+  const t = typeof v === 'string' ? Date.parse(v) : NaN
+  return Number.isFinite(t) ? t : null
+}
+const win = (label: string, used: unknown, resets?: unknown): UsageWindow[] => {
+  const usedPct = num(used)
+  return usedPct === null ? [] : [{ label, usedPct, resetsAt: time(resets) }]
+}
+
+function row(p: Record<string, unknown>, windows: UsageWindow[]): UsageRow {
+  if (p.status === 'ok' && windows.length > 0) return { windows, note: null }
+  const status = typeof p.status === 'string' ? p.status : 'unknown'
+  return { windows: [], note: clean(`${status} — ${typeof p.note === 'string' ? p.note : 'no figures reported'}`, 200) }
+}
+
+/** Throws on stdout that is not the script's JSON; everything else is tolerated. */
+function parseUsage(stdout: string): ScriptUsage {
+  const last = stdout.trim().split('\n').pop() ?? ''
+  let json: unknown
+  try {
+    json = JSON.parse(last)
+  } catch {
+    throw new Error('usage.sh printed no JSON')
+  }
+  const root = obj(json)
+  const codex = obj(root.codex)
+  const hours = num(codex.window_h)
+  const label = hours === 168 ? 'week' : hours === 5 ? '5h' : hours === null ? 'window' : `${hours}h`
+  const agy = obj(root.google)
+  const groups: [string, string][] = [['gemini', 'gemini'], ['claude/gpt', 'claude_gpt'], ['argon', 'argon']]
+  let agyWindows = groups.flatMap(([name, key]) => win(name, obj(agy[key]).weekly_used_pct, obj(agy[key]).weekly_resets_at))
+  if (agyWindows.length === 0) agyWindows = win('overall', agy.used_pct)
+  const or = obj(root.openrouter)
+  const remaining = num(or.credits_remaining_usd)
+  return {
+    codex: row(codex, [...win(label, codex.used_pct, codex.resets_at), ...(hours === 168 ? [] : win('week', codex.secondary_used_pct))]),
+    agy: row(agy, agyWindows),
+    openrouter:
+      or.status === 'ok' && remaining !== null
+        ? { credits: { remainingUsd: remaining, spentTodayUsd: num(or.spent_today_usd), usedPct: num(or.used_pct) }, note: null }
+        : { credits: null, note: row(or, []).note },
+  }
+}
+
+async function refreshUsage($: $, now: number): Promise<void> {
+  try {
+    const { rateLimits } = await $.session.usage()
+    const claude = rateLimits.flatMap(limit =>
+      win(limit.kind === 'five_hour' ? '5h' : limit.kind === 'seven_day' ? 'week' : clean(limit.kind, 30), limit.percentUsed, limit.resetsAt),
+    )
+    await update($, USAGE, (u): UsageState => ({ ...u, claude }))
+  } catch {
+    // Keep what is shown; Claude's figures are best effort.
+  }
+  const { attemptedAt } = await read($, USAGE)
+  if (attemptedAt === null || now - attemptedAt >= USAGE_REFRESH_MS) void runUsageScript($, now)
+}
+
+async function runUsageScript($: $, now: number): Promise<void> {
+  if (isUsageRunning) return
+  isUsageRunning = true
+  try {
+    await update($, USAGE, (u): UsageState => ({ ...u, isRefreshing: true, attemptedAt: now }))
+    const home = await $.env.get('HOME')
+    if (home === undefined || !home.startsWith('/')) throw new Error('HOME is not set')
+    const result = await $.process.run(['bash', `${home.replace(/\/+$/, '')}/${USAGE_SCRIPT}`], { timeoutMs: 180_000 })
+    if (result.exitCode !== 0) throw new Error(`usage.sh exited ${result.exitCode}`)
+    const script = parseUsage(result.stdout)
+    const updatedAt = await $.clock.now()
+    await update($, USAGE, (u): UsageState => ({ ...u, script, updatedAt, error: null }))
+  } catch (error) {
+    const detail = clean(error instanceof Error ? error.message : String(error), 200)
+    await update($, USAGE, (u): UsageState => ({ ...u, error: detail })).catch(() => {})
+  } finally {
+    isUsageRunning = false
+    await update($, USAGE, (u): UsageState => ({ ...u, isRefreshing: false })).catch(() => {})
+  }
+}
+
+function refreshNow($: $): void {
+  void $.clock.now().then(now => runUsageScript($, now))
 }
 
 async function pollRunLogs($: $, now: number): Promise<void> {
@@ -309,6 +422,8 @@ export const register: Register = on => {
       name: 'agent-inspector',
       description: 'Open the read-only Agent Inspector pane (orchestrator workers and Claude agents)',
     })
+    // A reload drops an in-flight usage.sh with the old environment; clear its flag.
+    await update($, USAGE, (u): UsageState => ({ ...u, isRefreshing: false }))
     // Timers die with this environment on reload; session.start runs again then.
     $.clock.every(POLL_MS, () => void poll($))
     return next(e)
@@ -321,6 +436,18 @@ export const register: Register = on => {
         ? 'Agent Inspector opened (read-only).'
         : `Agent Inspector is open but not drawn yet: ${opened.reason}`,
     }
+  })
+
+  // `/orchestrator` (typed or via the Skill tool) opens the pane. The skill's
+  // text passes through untouched; opening is best effort and never fails it.
+  on('skill.prompt', { skill: 'orchestrator' }, async ($, e, next) => {
+    const result = await next(e)
+    try {
+      await $.ui.open({ id: PANE, title: TITLE })
+    } catch {
+      // No surface to open on; the skill runs as before.
+    }
+    return result
   })
 
   // Observe only. `next(e)` is called exactly once, first; its result is
@@ -344,11 +471,12 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const [runsRaw, claude, view, status] = await Promise.all([
+    const [runsRaw, claude, view, status, usage] = await Promise.all([
       read($, RUNS),
       read($, CLAUDE),
       read($, VIEW),
       read($, STATUS),
+      read($, USAGE),
     ])
     const now = await $.clock.now()
     const runs = orderRuns(runsRaw)
@@ -370,6 +498,18 @@ export const register: Register = on => {
 
     const notice = dirNotice(status)
     if (notice !== null) used += 1
+
+    // Usage: a header line, four provider rows, and the last failure if any.
+    used += 5 + (usage.error !== null ? 1 : 0)
+    const usageHeader = (
+      <Box flexDirection="row" columnGap={1}>
+        <Text bold>Usage</Text>
+        <Text dimColor>
+          · {usage.updatedAt === null ? 'not loaded yet' : `updated ${clockTime(usage.updatedAt)} (${span(now - usage.updatedAt)} ago)`}
+        </Text>
+        <Button key="refresh" plain hotkey="r" label={usage.isRefreshing ? 'refreshing…' : 'r refresh'} onPress={() => refreshNow($)} />
+      </Box>
+    )
 
     // Worker list: a window around the selection, at most a third of the room.
     const listRoom = Math.max(3, Math.floor(rows / 3))
@@ -425,31 +565,40 @@ export const register: Register = on => {
       <Box flexDirection="column" width={width}>
         {header}
         {notice !== null && <Text color="warning">{notice}</Text>}
+        {usageHeader}
+        {usage.error !== null && <Text color="error">usage.sh: {usage.error} (showing the last good figures)</Text>}
+        {usageRows(Text, Box, usage, now)}
         {runRows.length > 0 && <Text dimColor>External workers</Text>}
         {runRows.map(run => (
-          <Button
-            key={`sel:${run.id}`}
-            plain
-            onPress={() => update($, VIEW, v => ({ ...v, selected: run.id, anchorSeq: null }))}
-          >
-            {run.id === selected ? '▸ ' : '  '}
-            {run.executor} <Text dimColor>{run.model ?? 'default model'}</Text> {run.label ?? run.id.slice(-8)}{' '}
-            <Text dimColor>{formatDuration(now - run.startedAt)}</Text> <Text color={stateColor(run)}>{stateLabel(run)}</Text>{' '}
-            <Text color={run.granularity === 'final-only' ? 'warning' : 'subtle'}>[{run.granularity}]</Text>
-            {run.warnings > 0 ? <Text color="warning"> ⚠{run.warnings}</Text> : ''}
-          </Button>
+          <Box key={`row:${run.id}`} flexDirection="row" columnGap={1}>
+            <Button
+              key={`sel:${run.id}`}
+              plain
+              label={`${run.id === selected ? '▸' : ' '} ${run.executor}`}
+              onPress={() => update($, VIEW, v => ({ ...v, selected: run.id, anchorSeq: null }))}
+            />
+            <Text>
+              <Text dimColor>{run.model ?? 'default model'}</Text> {run.label ?? run.id.slice(-8)}{' '}
+              <Text dimColor>{formatDuration(now - run.startedAt)}</Text> <Text color={stateColor(run)}>{stateLabel(run)}</Text>{' '}
+              <Text color={run.granularity === 'final-only' ? 'warning' : 'subtle'}>[{run.granularity}]</Text>
+              {run.warnings > 0 ? <Text color="warning"> ⚠{run.warnings}</Text> : ''}
+            </Text>
+          </Box>
         ))}
         {claudeRows.length > 0 && <Text dimColor>Claude agents</Text>}
         {claudeRows.map(agent => (
-          <Button
-            key={`sel:claude:${agent.id}`}
-            plain
-            onPress={() => update($, VIEW, v => ({ ...v, selected: `claude:${agent.id}`, anchorSeq: null }))}
-          >
-            {`claude:${agent.id}` === selected ? '▸ ' : '  '}
-            {agent.type} <Text dimColor>{agent.model ?? 'model not reported'}</Text> {agent.description}{' '}
-            <Text dimColor>{agent.status ?? 'status not reported'}</Text>
-          </Button>
+          <Box key={`row:claude:${agent.id}`} flexDirection="row" columnGap={1}>
+            <Button
+              key={`sel:claude:${agent.id}`}
+              plain
+              label={`${`claude:${agent.id}` === selected ? '▸' : ' '} ${agent.type}`}
+              onPress={() => update($, VIEW, v => ({ ...v, selected: `claude:${agent.id}`, anchorSeq: null }))}
+            />
+            <Text>
+              <Text dimColor>{agent.model ?? 'model not reported'}</Text> {agent.description}{' '}
+              <Text dimColor>{agent.status ?? 'status not reported'}</Text>
+            </Text>
+          </Box>
         ))}
         <Text dimColor>{'─'.repeat(Math.min(width, 80))}</Text>
         {detail}
@@ -464,6 +613,75 @@ export const register: Register = on => {
 
 type TextC = ElementConstructor<TextProps>
 type BoxC = ElementConstructor<BoxProps>
+
+/** "1h 8m", "5d 12h": a coarse span for resets and ages. */
+function span(ms: number): string {
+  const m = Math.max(0, Math.round(ms / 60_000))
+  if (m < 1) return '<1m'
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  return h < 24 ? `${h}h ${m % 60}m` : `${Math.floor(h / 24)}d ${h % 24}h`
+}
+
+/** Same thresholds as the orchestrator's routing; `usedPct` and `remainingUsd` are optional. */
+function usageColor(usedPct: number | null, remainingUsd?: number): string {
+  if ((usedPct ?? 0) >= 95 || (remainingUsd ?? Infinity) < 1) return 'error'
+  if ((usedPct ?? 0) >= 80 || (remainingUsd ?? Infinity) < 5) return 'warning'
+  return 'success'
+}
+
+function usageRow(Text: TextC, Box: BoxC, name: string, key: string, body: RenderElement | null, note: string | null): RenderElement {
+  return (
+    <Box key={`usage:${key}`} flexDirection="row">
+      <Text dimColor>{name.padEnd(12)}</Text>
+      {body ?? <Text dimColor>{note}</Text>}
+    </Box>
+  )
+}
+
+/** Remaining, not used. `compact` (agy): "gemini 60% · argon 100% left (week)", no resets. */
+function windowsBody(Text: TextC, windows: readonly UsageWindow[], now: number, compact: boolean): RenderElement | null {
+  if (windows.length === 0) return null
+  return (
+    <Text>
+      {windows.map((w, i) => (
+        <Text key={w.label}>
+          {i > 0 ? ' · ' : ''}
+          {w.label} <Text color={usageColor(w.usedPct)}>{Math.max(0, Math.round(100 - w.usedPct))}%</Text>
+          {compact ? '' : ' left'}
+          {!compact && w.resetsAt !== null ? <Text dimColor> (resets {span(w.resetsAt - now)})</Text> : ''}
+        </Text>
+      ))}
+      {compact ? ' left (week)' : ''}
+    </Text>
+  )
+}
+
+function usageRows(Text: TextC, Box: BoxC, usage: UsageState, now: number): RenderElement {
+  const s: ScriptUsage | null = usage.script
+  const pending = usage.isRefreshing ? 'loading…' : 'not loaded yet'
+  const credits = s?.openrouter.credits ?? null
+  return (
+    <Box flexDirection="column">
+      {usageRow(Text, Box, 'Claude', 'claude', windowsBody(Text, usage.claude, now, false), 'no rate-limit windows reported (not on a subscription, or no API response yet)')}
+      {usageRow(Text, Box, 'Codex', 'codex', windowsBody(Text, s?.codex.windows ?? [], now, false), s === null ? pending : s.codex.note)}
+      {usageRow(Text, Box, 'Antigravity', 'agy', windowsBody(Text, s?.agy.windows ?? [], now, true), s === null ? pending : s.agy.note)}
+      {usageRow(
+        Text,
+        Box,
+        'OpenRouter',
+        'openrouter',
+        credits === null ? null : (
+          <Text>
+            <Text color={usageColor(null, credits.remainingUsd)}>${credits.remainingUsd.toFixed(2)}</Text> left
+            {credits.spentTodayUsd !== null ? ` · $${credits.spentTodayUsd.toFixed(2)} spent today` : ''}
+          </Text>
+        ),
+        s === null ? pending : s.openrouter.note,
+      )}
+    </Box>
+  )
+}
 
 function dirNotice(status: InspectorStatus): string | null {
   if (status.dir === 'unavailable') return `Log directory unavailable (${status.detail}); external runs are not shown.`

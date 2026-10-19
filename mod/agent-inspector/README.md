@@ -1,7 +1,12 @@
 # agent-inspector
 
-A read-only Claude Code (2.1.299) mod: a pane that shows what delegated workers are doing.
+A Claude Code (2.1.299) mod: a pane that shows what delegated workers are doing, with a Usage section on top.
 
+- **Usage**: the REMAINING (100 - used) quota for Claude Code (5-hour and weekly windows, from the session's
+  rate limits), Codex, Antigravity (agy) and the dollars left on OpenRouter, coloured by the orchestrator's
+  routing thresholds (used >= 80% or < $5: warning; used >= 95% or < $1: error). Codex, agy and OpenRouter come from
+  the orchestrator's read-only status script `~/.claude/skills/orchestrator/scripts/usage.sh`. A provider that
+  cannot be read shows `unknown` and its note, never a guess.
 - **External workers** (Codex, Pi, agy): read from the per-run logs the orchestrator wrappers write to
   `$XDG_RUNTIME_DIR/orchestrator/` ([log contract](../../docs/LOG_CONTRACT.md)): the lifecycle file
   `<run-id>.jsonl` (start, final, exit) and the event segments `<run-id>.<n>.jsonl`. Per run: executor,
@@ -27,17 +32,26 @@ claude --plugin-dir /path/to/SonoranClaudeRouter/mod/agent-inspector
 ln -s /path/to/SonoranClaudeRouter/mod/agent-inspector ~/.claude/dev-mods/agent-inspector
 ```
 
-Open it with `/agent-inspector`. It never opens itself. Keys while the pane has focus: `k`/`j` previous/next
+Open it with `/agent-inspector`; it also opens itself when the `/orchestrator` skill runs (a `skill.prompt` hook
+that leaves the skill text untouched). Keys while the pane has focus: `k`/`j` previous/next
 worker, `u`/`d` scroll events older/newer, `f` follow the tail on/off (on by default), `x` expand long events
-(2,000 characters shown, up to 20,000 kept).
+(2,000 characters shown, up to 20,000 kept), `r` refresh usage.
 
 Checks: `claude plugin validate mod/agent-inspector` and `claude plugin test mod/agent-inspector`.
 
 ## Limitations
 
-- **Read-only.** No tool, prompt or session-append hooks; no steering, cancellation, model switching, file
-  writes or process spawning. The `agent.spawn` hook only observes: it forwards the spawn exactly once and returns
+- **Read-only.** No tool or session-append hooks; no steering, cancellation, model switching or file writes. The
+  only process it runs is `usage.sh` (a read-only status script that prints one JSON line and never prints keys),
+  only while the pane is placed. The `agent.spawn` hook only observes: it forwards the spawn exactly once and returns
   its result (or rejection) unchanged; its own bookkeeping cannot fail it. Closing the pane changes nothing.
+- **Usage refresh.** Claude's windows are re-read every second while the pane is placed. `usage.sh` takes 10-70 s,
+  so it runs in the background: when the pane is first seen with no data or data older than 5 minutes, then every
+  5 minutes while it stays placed, and on `r`; never while the pane is closed. The cadence and the script path
+  (`$HOME/.claude/skills/orchestrator/scripts/usage.sh`) are constants in `hooks/register.tsx`. A failed run (non-zero
+  exit, 3-minute timeout, unreadable output) shows an error line and keeps the last good figures with their age.
+  Claude's figures come from the session's rate-limit windows: they are empty off a subscription, and before the
+  first API response of a session. Only display fields are kept in state (no key sources, no raw output).
 - **Polling.** A 1 s timer runs for the session, but while the pane is not placed each tick is a single
   `$.ui.panes()` call with no file system work. A log is read only when its size or mtime changed.
 - **No ranged reads.** `$.fs.read` in 2.1.299 returns a whole file and refuses files over 4 MiB, so the mod

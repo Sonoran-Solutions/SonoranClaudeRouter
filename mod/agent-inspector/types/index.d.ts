@@ -102,6 +102,39 @@ export type InspectorStatus = {
   dropped: string[]
 }
 
+/** One usage window of a provider; `usedPct` is what is spent (the pane shows 100 - it). */
+export type UsageWindow = {
+  label: string
+  usedPct: number
+  /** ms since the epoch. */
+  resetsAt: number | null
+}
+
+/** Windows when the provider answered; else `note` says why not. */
+export type UsageRow = { windows: UsageWindow[]; note: string | null }
+
+export type OpenRouterUsage = {
+  credits: { remainingUsd: number; spentTodayUsd: number | null; usedPct: number | null } | null
+  note: string | null
+}
+
+/** Display fields of `usage.sh` (Codex, agy, OpenRouter); never keys or raw output. */
+export type ScriptUsage = { codex: UsageRow; agy: UsageRow; openrouter: OpenRouterUsage }
+
+export type UsageState = {
+  /** Claude Code's own rate-limit windows from `$.session.usage()`; empty off a subscription. */
+  claude: UsageWindow[]
+  /** The last good `usage.sh` snapshot. */
+  script: ScriptUsage | null
+  /** When `script` was fetched (ms). */
+  updatedAt: number | null
+  /** When `usage.sh` was last started (ms); paces the 5-minute refresh, failures included. */
+  attemptedAt: number | null
+  isRefreshing: boolean
+  /** The last `usage.sh` failure; cleared by the next good run. */
+  error: string | null
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'agent-inspector': {
@@ -110,6 +143,7 @@ declare module 'claude-code' {
       claude: ClaudeAgent[]
       view: InspectorView
       status: InspectorStatus
+      usage: UsageState
     }
   }
 }
