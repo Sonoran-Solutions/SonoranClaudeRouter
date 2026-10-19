@@ -1,13 +1,15 @@
 # Agent Inspector: implementation plan
 
 Date: 2026-10-19  
-**Status: proposal only; no implementation authorized.** The existing router is at `~/.claude/skills/orchestrator`. The [owner-machine review](https://github.com/Sonoran-Solutions/SonoranClaudeRouter/pull/1#issuecomment-6272603341) established the native mod and one-shot wrapper interfaces.
+**Status: MVP implemented on branch `feat/agent-inspector-mvp`; see [evidence](EVIDENCE.md) for which gates are met.** The existing router is at `~/.claude/skills/orchestrator`. The [owner-machine review](https://github.com/Sonoran-Solutions/SonoranClaudeRouter/pull/1#issuecomment-6272603341) established the native mod and one-shot wrapper interfaces.
 
 ## 0. Native pane
 
 Copy the installed Claude Code 2.1.299 `plugin-authoring/pane.tsx` example. Use `$.ui.open` + `ui.render` to display a read-only `Pane` with synthetic workers.
 
 **Gate:** pane opens, updates, and closes cleanly in the desktop app. Record a screenshot and installed version; no fallback frontend.
+
+**Done:** [`mod/agent-inspector/`](../mod/agent-inspector/) (validate + 18 plugin tests on 2.1.299). **Open:** in-app observation by a person.
 
 ## 1. External runners first
 
@@ -23,11 +25,15 @@ Pane polls files with `$.fs` / `$.clock.every`, renders complete records, tolera
 
 **Gate:** Codex and Pi each show a real event *before exit*; agy is accurately marked final-only. Verify same final result and exit code with monitoring on/off, including when log writing fails.
 
+**Done:** [`orchestrator/`](../orchestrator/) + [`tests/wrappers.test.sh`](../tests/wrappers.test.sh); live Codex and Pi records observed seconds before exit; on/off identical. **Open:** agy live run; installing into the live skill.
+
 ## 2. Claude attribution
 
 Show Claude-native agent IDs/models and parent/task relationships through `agent.spawn`, `$.agent.list()`, and only supported `turn.step` content. Do not invent raw reasoning or scrape transcripts. Any quota display reads existing `usage.sh` data with source age; OpenRouter is Pi's backend, not another worker.
 
 **Gate:** concurrent Claude/Codex/Pi work remains correctly separated.
+
+**Done in code:** observe-only `agent.spawn` + `$.agent.list()` in their own pane group (2.1.299's list exposes no model; spawn does). **Open:** live concurrent check. Quota display deferred.
 
 ## 3. Acceptance
 
