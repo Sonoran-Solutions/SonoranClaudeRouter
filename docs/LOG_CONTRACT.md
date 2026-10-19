@@ -42,7 +42,9 @@ through (after redaction, and for pi after field trimming, below), plus `orchest
 basename. `parent` comes from `ORCH_PARENT` only; nothing infers it. `session_id`, `session_title` and `project` are
 best effort: they are read once at start from `$CLAUDE_CODE_SESSION_ID` and that session's transcript under
 `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/*/<session-id>.jsonl` (last `custom-title` record and first `cwd`), and
-are `null` (or `workdir`) when anything is missing or fails; the worker's behaviour and exit status never change.
+are `null` (or `workdir`) when anything is missing or fails; that lookup reads at most `ORCH_RUNLOG_TRANSCRIPT_MAX_BYTES`
+(default 8 MiB) from each end of the transcript and gives up after `ORCH_RUNLOG_SESSION_TIMEOUT` seconds (default 2),
+leaving the fields `null`, so it never delays the worker; the worker's behaviour and exit status never change.
 
 A run whose lifecycle file has a start record and no exit record is **running** while the wrapper PID is alive;
 the mod must otherwise show it as **unknown**, never as failed. A segment that disappears before the mod has read it

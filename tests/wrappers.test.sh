@@ -470,6 +470,90 @@ run codex 1 0 CLAUDE_CODE_SESSION_ID="$session_uuid" CLAUDE_CONFIG_DIR="$tmp/no-
 check 'missing transcript title null, project from workdir' jq -se --arg workdir "$tmp/work" \
   '.[0].session_id != null and .[0].session_title == null and .[0].project == $workdir' "$log"
 
+# Bounds: a huge or slow transcript must never delay the worker (it is dashboard metadata only).
+slow_uuid=5e5510a4-0000-4000-8000-00000000abcd
+slow_claude=$tmp/slow-claude
+mkdir -p "$slow_claude/projects/-x-slow"
+slow_transcript=$slow_claude/projects/-x-slow/$slow_uuid.jsonl
+{
+  jq -nc '{type:"user", cwd:"/x/slow", message:{role:"user"}}'
+  jq -nc '{type:"custom-title", customTitle:"Slow name", sessionId:"'"$slow_uuid"'"}'
+} > "$slow_transcript"
+# A fake tail/head that blocks (with a unique marker in its args) whenever it reads the slow transcript.
+slowbin=$tmp/slowbin
+mkdir -p "$slowbin"
+REAL_TAIL=$(command -v tail) REAL_HEAD=$(command -v head)
+# Anchored pgrep -f: matches only the blocked reader's own command line, never this test's.
+slow_marker="trslow$((RANDOM % 100000))"
+for tool in tail head; do
+  real=$(eval "printf %s \"\$REAL_${tool^^}\"")
+  cat > "$slowbin/$tool" <<SLOW
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case \$a in
+    *$slow_uuid.jsonl)
+      # Block forever-ish with the marker in argv (exec -a) so the test can find any leftover process.
+      exec -a $slow_marker sleep 30
+      ;;
+  esac
+done
+exec $real "\$@"
+SLOW
+  chmod +x "$slowbin/$tool"
+done
+slow_start=$(date +%s%N)
+run codex 1 0 PATH="$slowbin:$PATH" CLAUDE_CODE_SESSION_ID="$slow_uuid" \
+  CLAUDE_CONFIG_DIR="$slow_claude" ORCH_RUNLOG_SESSION_TIMEOUT=1
+slow_ms=$(( ($(date +%s%N) - slow_start) / 1000000 ))
+check 'slow transcript run succeeds' test "$result" = 0
+check 'slow transcript does not delay the worker' test "$slow_ms" -lt 10000
+# The block is real: without a time bound the lookup would have waited the full fake sleep.
+check 'slow transcript timeout is bounded' test "$slow_ms" -ge 500 -a "$slow_ms" -lt 10000
+check 'slow transcript session id still recorded' jq -se --arg id "$slow_uuid" --arg workdir "$tmp/work" \
+  '.[0].session_id == $id and .[0].session_title == null and .[0].project == $workdir' "$log"
+# timeout kills the whole pipeline: nothing of the fake sleep may outlive the run.
+sleep 1
+# The blocked process' cmdline is "<marker> 30" (sleep's argv[0] replaced by exec -a).
+slow_left=$(pgrep -fc "^$slow_marker 30$" 2>/dev/null) || slow_left=0
+check 'slow transcript leaves no blocked reader' test "$slow_left" = 0
+slow_stdout=$(cat "$stdout") slow_stderr=$(cat "$stderr")
+check 'slow transcript writes nothing to stdout/stderr' test "$slow_stdout" = done -a -z "$slow_stderr"
+
+# Byte bound: only the last ORCH_RUNLOG_TRANSCRIPT_MAX_BYTES are scanned for the title, only the first for the cwd.
+byte_uuid=5e5510a4-0000-4000-8000-00000000beef
+byte_claude=$tmp/byte-claude
+mkdir -p "$byte_claude/projects/-y"
+byte_pad=$(head -c 3000 /dev/zero | tr '\0' 'q')
+# Title at the start, cwd only after the first 1000 bytes: both fall outside the bound.
+{
+  jq -nc '{type:"custom-title", customTitle:"Start name"}'
+  jq -nc --arg pad "$byte_pad" '{type:"assistant", pad:$pad}'
+  jq -nc '{type:"user", cwd:"/late/proj", message:{role:"user"}}'
+} > "$byte_claude/projects/-y/$byte_uuid.jsonl"
+run codex 1 0 CLAUDE_CODE_SESSION_ID="$byte_uuid" CLAUDE_CONFIG_DIR="$byte_claude" \
+  ORCH_RUNLOG_TRANSCRIPT_MAX_BYTES=1000
+check 'title/cwd outside max bytes are not read' jq -se --arg id "$byte_uuid" --arg workdir "$tmp/work" \
+  '.[0].session_id == $id and .[0].session_title == null and .[0].project == $workdir' "$log"
+# Title within the last 1000 bytes and cwd within the first 1000 bytes: both found.
+{
+  jq -nc '{type:"user", cwd:"/early/proj", message:{role:"user"}}'
+  jq -nc --arg pad "$byte_pad" '{type:"assistant", pad:$pad}'
+  jq -nc '{type:"custom-title", customTitle:"End name"}'
+} > "$byte_claude/projects/-y/$byte_uuid.jsonl"
+run codex 1 0 CLAUDE_CODE_SESSION_ID="$byte_uuid" CLAUDE_CONFIG_DIR="$byte_claude" \
+  ORCH_RUNLOG_TRANSCRIPT_MAX_BYTES=1000
+check 'title/cwd inside max bytes are read' jq -se \
+  '.[0].session_title == "End name" and .[0].project == "/early/proj"' "$log"
+# Without the bound the same transcript still yields the title (the bound is what hid it above).
+{
+  jq -nc '{type:"custom-title", customTitle:"Start name"}'
+  jq -nc --arg pad "$byte_pad" '{type:"assistant", pad:$pad}'
+  jq -nc '{type:"user", cwd:"/late/proj", message:{role:"user"}}'
+} > "$byte_claude/projects/-y/$byte_uuid.jsonl"
+run codex 1 0 CLAUDE_CODE_SESSION_ID="$byte_uuid" CLAUDE_CONFIG_DIR="$byte_claude"
+check 'unbounded lookup still finds the whole-file title' jq -se \
+  '.[0].session_title == "Start name" and .[0].project == "/late/proj"' "$log"
+
 run codex 1 0 ORCH_LABEL='custom label' ORCH_PARENT=parent-task
 check 'explicit label/parent' jq -se '.[0].label == "custom label" and .[0].parent == "parent-task"' "$log"
 run codex 1 0 FAKE_UMASK_FILE="$tmp/work/umask-off"
