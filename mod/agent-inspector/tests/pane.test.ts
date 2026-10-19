@@ -114,8 +114,8 @@ test('the pane lists workers and labels agy final-only on terminal and desktop',
       plugin: 'agent-inspector', surface, component: 'Pane', requestId: 'agent-inspector',
       props: PANE, viewport: { columns: 140, rows: 44 },
     })
-    expect((await ui.find({ type: 'Button', key: `sel:${AGY}` }))?.text).toMatch(/agy.*running.*\[final-only\]/)
-    expect((await ui.find({ type: 'Button', key: `sel:${CODEX}` }))?.text).toMatch(/codex.*gpt-5\.5.*exited 0.*\[live\]/)
+    expect((await ui.find({ type: 'Box', key: `row:${AGY}` }))?.text).toMatch(/agy.*running.*\[final-only\]/)
+    expect((await ui.find({ type: 'Box', key: `row:${CODEX}` }))?.text).toMatch(/codex.*gpt-5\.5.*exited 0.*\[live\]/)
     expect(await ui.find({ text: /no incremental output/ })).toBeDefined()
 
     // j selects the codex run; its events from segment 1 and its final answer show.
@@ -297,8 +297,9 @@ test('agy with a capped final response: exited 0, final and truncation warning s
   const events = w.state.get(`events:${AGY2}`) as RunEvents
   expect(events.items.map(one => one.kind)).toEqual(['status', 'final', 'warning', 'status'])
   for (const surface of SURFACES) {
-    const ui = await $.ui.mount({ plugin: 'agent-inspector', surface, component: 'Pane', requestId: 'agent-inspector', props: PANE })
-    expect((await ui.find({ type: 'Button', key: `sel:${AGY2}` }))?.text).toMatch(/exited 0.*\[final-only\]/)
+    // Taller than PANE: the Usage section takes 5 rows and the 2,000-char final fills ~21.
+    const ui = await $.ui.mount({ plugin: 'agent-inspector', surface, component: 'Pane', requestId: 'agent-inspector', props: { ...PANE, scroll: { offset: 0, bodyRows: 50 } } })
+    expect((await ui.find({ type: 'Box', key: `row:${AGY2}` }))?.text).toMatch(/exited 0.*\[final-only\]/)
     expect(await ui.find({ type: 'Text', text: /^final$/ })).toBeDefined()
     expect(await ui.find({ text: /agy final response was 4500000 characters; the log keeps the first 65536/ })).toBeDefined()
     await ui.unmount()
@@ -345,4 +346,17 @@ test('/agent-inspector opens the pane and answers with text', async ($, on) => {
     origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 140 },
   })
   expect(ran.text).toBe('Agent Inspector opened (read-only).')
+})
+
+test('/orchestrator opens the pane and leaves the skill text unchanged', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const opened: string[] = []
+  on('ui.open', ($, e) => (opened.push(e.id), { value: { isPlaced: true as const } }))
+  on('skill.prompt', () => ({ text: 'orchestrate this' }))
+  const other = await $.skill.prompt({ skill: 'commit', text: 'x' })
+  expect(opened).toEqual([])
+  const ran = await $.skill.prompt({ skill: 'orchestrator', text: 'x' })
+  expect(ran.text).toBe('orchestrate this')
+  expect(other.text).toBe('orchestrate this')
+  expect(opened).toEqual(['agent-inspector'])
 })

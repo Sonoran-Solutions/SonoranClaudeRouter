@@ -3,8 +3,11 @@
 // over the Claude-native agents `agent.spawn` / `$.agent.list()` expose.
 //
 // Read-only by construction: it hooks session.start, command.run (its own
-// command), agent.spawn (observe only, pass-through) and ui.render (its own
-// pane). It never writes files, spawns processes, steers, cancels or gates.
+// command), skill.prompt (opens the pane for /orchestrator; the skill text is
+// untouched), agent.spawn (observe only, pass-through) and ui.render (its own
+// pane). It never writes files, steers, cancels or gates. The one process it
+// runs is the orchestrator's read-only status script usage.sh (via
+// $.process.run, only while the pane is placed) for the Usage section.
 import { atom, read, update } from 'claude-code'
 import type {
   AgentInfo,
@@ -23,6 +26,10 @@ import type {
   InspectorView,
   RunEvents,
   RunSummary,
+  ScriptUsage,
+  UsageRow,
+  UsageState,
+  UsageWindow,
 } from '../types'
 import type { ListedFile, ListedRun } from './reader'
 import { advanceRunFiles } from './reader'
@@ -48,6 +55,51 @@ const TITLE = 'Agent Inspector'
 const POLL_MS = 1000
 /** No new line for this long reads "quiet", which is not "stalled". */
 const QUIET_MS = 30_000
+// ponytail: fixed 5-minute cadence and a hardcoded script path. Ceiling: a user
+// with another skills dir or a different cadence edits these two constants;
+// upgrade path is a userConfig field (plugin.json) read with $.settings.
+const USAGE_REFRESH_MS = 5 * 60_000
+/** The marker an event cut to fit its room ends with. */
+const CUT_MARKER = '… [x to expand]'
+/** Below this many body rows the Usage section is a single line. */
+const COMPACT_BELOW_ROWS = 24
+const USAGE_SCRIPT = '.claude/skills/orchestrator/scripts/usage.sh' // under $HOME
+
+// ---------------------------------------------------------------------------
+// Pane budget: how many rows each section may take, so the drawing never
+// outgrows the body (supported minimum: 12 rows x 70 columns).
+
+export type PaneBudgetInput = {
+  rows: number
+  width: number
+  hasNotice: boolean
+  hasUsageError: boolean
+  groups: number
+  ids: number
+  selection: 'none' | 'run' | 'claude'
+}
+
+export type PaneBudget = { isCompact: boolean; fixed: number; listRoom: number; eventRoom: number }
+
+/**
+ * The rows every non-list section claims, one per rendered line in compact
+ * mode and the full-sized sections above it.
+ */
+export function paneBudget(input: PaneBudgetInput): PaneBudget {
+  const { rows, width, hasNotice, hasUsageError, groups, ids, selection } = input
+  const isCompact = rows < COMPACT_BELOW_ROWS
+  const usage = isCompact ? 1 : 5 + (hasUsageError ? 1 : 0)
+  const controls = isCompact ? 1 : width < 70 ? 2 : 1
+  // claudeDetail and runDetail are 4 lines; compact panes draw one line each.
+  const summary = selection === 'none' ? 1 : isCompact ? 1 : 4
+  const fixed = 1 + (hasNotice ? 1 : 0) + usage + 1 + controls + summary
+  const spare = rows - fixed - groups
+  const cap = Math.max(3, Math.floor(rows / 3))
+  const listRoom = Math.max(1, Math.min(cap, spare - 3, ids))
+  let eventRoom = Math.max(isCompact ? 1 : 3, spare - Math.min(listRoom, ids))
+  if (fixed + groups + Math.min(listRoom, ids) + eventRoom > rows) eventRoom -= 1
+  return { isCompact, fixed, listRoom, eventRoom }
+}
 
 const RUNS = atom({ plugin: 'agent-inspector', key: 'runs' } as const, [])
 const CLAUDE = atom({ plugin: 'agent-inspector', key: 'claude' } as const, [])
@@ -61,6 +113,14 @@ const STATUS = atom({ plugin: 'agent-inspector', key: 'status' } as const, {
   detail: null,
   polledAt: null,
   dropped: [],
+})
+const USAGE = atom({ plugin: 'agent-inspector', key: 'usage' } as const, {
+  claude: [],
+  script: null,
+  updatedAt: null,
+  attemptedAt: null,
+  isRefreshing: false,
+  error: null,
 })
 const EVENTS = { plugin: 'agent-inspector', key: 'events' } as const
 
@@ -85,6 +145,7 @@ async function poll($: $): Promise<void> {
     if (!panes.some(pane => pane.id === PANE && pane.isPlaced)) return
     const now = await $.clock.now()
     await refreshClaude($, now)
+    await refreshUsage($, now)
     await pollRunLogs($, now)
   } catch (error) {
     // Monitoring degrades; nothing else is touched.
@@ -93,6 +154,112 @@ async function poll($: $): Promise<void> {
   } finally {
     isPolling = false
   }
+}
+
+// ---------------------------------------------------------------------------
+// Usage: Claude's windows every tick (free); usage.sh (10-70 s) in the
+// background, at most once at a time, never while the pane is not placed.
+
+let isUsageRunning = false // ponytail: per-environment guard, like isPolling.
+
+const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+const obj = (v: unknown): Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+const time = (v: unknown): number | null => {
+  const t = typeof v === 'string' ? Date.parse(v) : NaN
+  return Number.isFinite(t) ? t : null
+}
+const win = (label: string, used: unknown, resets?: unknown, scope?: string): UsageWindow[] => {
+  const usedPct = num(used)
+  return usedPct === null ? [] : [{ label, usedPct, resetsAt: time(resets), ...(scope === undefined ? {} : { scope }) }]
+}
+
+/** One agy window per group from its tighter (larger) of 5h and week. */
+function groupWin(label: string, g: Record<string, unknown>): UsageWindow[] {
+  const fiveHour = num(g.five_hour_used_pct)
+  const weekly = num(g.weekly_used_pct)
+  if (fiveHour === null && weekly === null) return []
+  const isFiveHour = fiveHour !== null && (weekly === null || fiveHour > weekly)
+  return isFiveHour
+    ? [{ label, usedPct: fiveHour, resetsAt: null, scope: '5h' }]
+    : [{ label, usedPct: weekly as number, resetsAt: time(g.weekly_resets_at), scope: 'week' }]
+}
+
+function row(p: Record<string, unknown>, windows: UsageWindow[]): UsageRow {
+  if (p.status === 'ok' && windows.length > 0) return { windows, note: null }
+  const status = typeof p.status === 'string' ? p.status : 'unknown'
+  return { windows: [], note: clean(`${status} — ${typeof p.note === 'string' ? p.note : 'no figures reported'}`, 200) }
+}
+
+/** Throws on stdout that is not the script's JSON; everything else is tolerated. */
+function parseUsage(stdout: string): ScriptUsage {
+  const last = stdout.trim().split('\n').pop() ?? ''
+  let json: unknown
+  try {
+    json = JSON.parse(last)
+  } catch {
+    throw new Error('usage.sh printed no JSON')
+  }
+  const root = obj(json)
+  const isSection = (v: unknown): boolean => typeof obj(v).status === 'string'
+  // Valid JSON with no provider sections at all is not a snapshot: keep the last good one.
+  if (![root.codex, root.google, root.openrouter].some(isSection)) throw new Error('usage.sh printed malformed JSON (no provider sections)')
+  const codex = obj(root.codex)
+  const hours = num(codex.window_h)
+  const label = hours === 168 ? 'week' : hours === 5 ? '5h' : hours === null ? 'window' : `${hours}h`
+  const agy = obj(root.google)
+  const groups: [string, string][] = [['gemini', 'gemini'], ['claude/gpt', 'claude_gpt'], ['argon', 'argon']]
+  let agyWindows = groups.flatMap(([name, key]) => groupWin(name, obj(agy[key])))
+  if (agyWindows.length === 0) agyWindows = win('agy', agy.used_pct, undefined, 'overall')
+  const or = obj(root.openrouter)
+  const remaining = num(or.credits_remaining_usd)
+  return {
+    codex: row(codex, [...win(label, codex.used_pct, codex.resets_at), ...(hours === 168 ? [] : win('week', codex.secondary_used_pct))]),
+    agy: row(agy, agyWindows),
+    openrouter:
+      or.status === 'ok' && remaining !== null
+        ? { credits: { remainingUsd: remaining, spentTodayUsd: num(or.spent_today_usd), usedPct: num(or.used_pct) }, note: null }
+        : { credits: null, note: row(or, []).note },
+  }
+}
+
+async function refreshUsage($: $, now: number): Promise<void> {
+  try {
+    const { rateLimits } = await $.session.usage()
+    const claude = rateLimits.flatMap(limit =>
+      win(limit.kind === 'five_hour' ? '5h' : limit.kind === 'seven_day' ? 'week' : clean(limit.kind, 30), limit.percentUsed, limit.resetsAt),
+    )
+    await update($, USAGE, (u): UsageState => ({ ...u, claude }))
+  } catch {
+    // Keep what is shown; Claude's figures are best effort.
+  }
+  const { attemptedAt } = await read($, USAGE)
+  if (attemptedAt === null || now - attemptedAt >= USAGE_REFRESH_MS) void runUsageScript($, now)
+}
+
+async function runUsageScript($: $, now: number): Promise<void> {
+  if (isUsageRunning) return
+  isUsageRunning = true
+  try {
+    await update($, USAGE, (u): UsageState => ({ ...u, isRefreshing: true, attemptedAt: now }))
+    const home = await $.env.get('HOME')
+    if (home === undefined || !home.startsWith('/')) throw new Error('HOME is not set')
+    const result = await $.process.run(['bash', `${home.replace(/\/+$/, '')}/${USAGE_SCRIPT}`], { timeoutMs: 180_000 })
+    if (result.exitCode !== 0) throw new Error(`usage.sh exited ${result.exitCode}`)
+    const script = parseUsage(result.stdout)
+    const updatedAt = await $.clock.now()
+    await update($, USAGE, (u): UsageState => ({ ...u, script, updatedAt, error: null }))
+  } catch (error) {
+    const detail = clean(error instanceof Error ? error.message : String(error), 200)
+    await update($, USAGE, (u): UsageState => ({ ...u, error: detail })).catch(() => {})
+  } finally {
+    isUsageRunning = false
+    await update($, USAGE, (u): UsageState => ({ ...u, isRefreshing: false })).catch(() => {})
+  }
+}
+
+function refreshNow($: $): void {
+  void $.clock.now().then(now => runUsageScript($, now))
 }
 
 async function pollRunLogs($: $, now: number): Promise<void> {
@@ -309,6 +476,8 @@ export const register: Register = on => {
       name: 'agent-inspector',
       description: 'Open the read-only Agent Inspector pane (orchestrator workers and Claude agents)',
     })
+    // A reload drops an in-flight usage.sh with the old environment; clear its flag.
+    await update($, USAGE, (u): UsageState => ({ ...u, isRefreshing: false }))
     // Timers die with this environment on reload; session.start runs again then.
     $.clock.every(POLL_MS, () => void poll($))
     return next(e)
@@ -321,6 +490,18 @@ export const register: Register = on => {
         ? 'Agent Inspector opened (read-only).'
         : `Agent Inspector is open but not drawn yet: ${opened.reason}`,
     }
+  })
+
+  // `/orchestrator` (typed or via the Skill tool) opens the pane. The skill's
+  // text passes through untouched; opening is best effort and never fails it.
+  on('skill.prompt', { skill: 'orchestrator' }, async ($, e, next) => {
+    const result = await next(e)
+    try {
+      await $.ui.open({ id: PANE, title: TITLE })
+    } catch {
+      // No surface to open on; the skill runs as before.
+    }
+    return result
   })
 
   // Observe only. `next(e)` is called exactly once, first; its result is
@@ -344,79 +525,106 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const [runsRaw, claude, view, status] = await Promise.all([
+    const [runsRaw, claude, view, status, usage] = await Promise.all([
       read($, RUNS),
       read($, CLAUDE),
       read($, VIEW),
       read($, STATUS),
+      read($, USAGE),
     ])
     const now = await $.clock.now()
     const runs = orderRuns(runsRaw)
     const ids = [...runs.map(run => run.id), ...claude.map(agent => `claude:${agent.id}`)]
     const selected = currentSelection(view, ids)
     const width = Math.max(24, e.props.bodyColumns)
-    const rows = Math.max(12, e.props.scroll.bodyRows)
-    let used = 0
-
+    const rows = Math.max(1, e.props.scroll.bodyRows)
+    // Short panes: Usage collapses to one line so the event list keeps its room, and
+    // every fixed row is drawn on exactly one line (truncated at the edge).
+    const isCompact = rows < COMPACT_BELOW_ROWS
+    const truncate = isCompact ? ('truncate-end' as const) : undefined
     const header = (
       <Box flexDirection="row" justifyContent="space-between">
-        <Text bold>
+        <Text bold wrap={truncate}>
           {TITLE} <Text dimColor>· read-only · {runs.length} run{runs.length === 1 ? '' : 's'} · {claude.length} Claude agent{claude.length === 1 ? '' : 's'}</Text>
         </Text>
-        {status.polledAt !== null && <Text dimColor>polled {clockTime(status.polledAt)}</Text>}
+        {status.polledAt !== null && <Text dimColor wrap={truncate}>polled {clockTime(status.polledAt)}</Text>}
       </Box>
     )
-    used += 1
 
     const notice = dirNotice(status)
-    if (notice !== null) used += 1
 
-    // Worker list: a window around the selection, at most a third of the room.
-    const listRoom = Math.max(3, Math.floor(rows / 3))
-    const window = listWindow(ids, selected, listRoom)
-    used += window.length + (runs.length > 0 ? 1 : 0) + (claude.length > 0 ? 1 : 0) + 1
+    const refresh = (
+      <Button key="refresh" plain hotkey="r" label={usage.isRefreshing ? 'refreshing…' : isCompact ? '↻' : 'refresh'} onPress={() => refreshNow($)} />
+    )
+    const usageHeader = (
+      <Box flexDirection="row" columnGap={1}>
+        <Text bold>Usage</Text>
+        <Text dimColor>
+          · {usage.updatedAt === null ? 'not loaded yet' : `updated ${clockTime(usage.updatedAt)} (${span(now - usage.updatedAt)} ago)`}
+        </Text>
+        {refresh}
+      </Box>
+    )
+
+    // Fixed rows first (header, notice, usage, separator, controls, run detail
+    // summary); the worker list and the event list share what is left (see
+    // paneBudget).
+    const hasError = usage.error !== null
+    const groups = (runs.length > 0 ? 1 : 0) + (claude.length > 0 ? 1 : 0)
+    const budget = paneBudget({
+      rows,
+      width,
+      hasNotice: notice !== null,
+      hasUsageError: hasError,
+      groups,
+      ids: ids.length,
+      selection: selected === null ? 'none' : selected.startsWith('claude:') ? 'claude' : 'run',
+    })
+    const window = listWindow(ids, selected, budget.listRoom)
     const runRows = runs.filter(run => window.includes(run.id))
     const claudeRows = claude.filter(agent => window.includes(`claude:${agent.id}`))
 
     const controls = (
-      <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-        <Button key="prev" plain hotkey="k" label="prev" onPress={() => moveSelection($, -1)} />
-        <Button key="next" plain hotkey="j" label="next" onPress={() => moveSelection($, 1)} />
-        <Button key="older" plain hotkey="u" label="older" onPress={() => scrollEvents($, -5)} />
-        <Button key="newer" plain hotkey="d" label="newer" onPress={() => scrollEvents($, 5)} />
+      <Box flexDirection="row" flexWrap={isCompact ? 'nowrap' : 'wrap'} columnGap={1}>
+        <Button key="prev" plain hotkey="k" label={isCompact ? 'k' : 'prev'} onPress={() => moveSelection($, -1)} />
+        <Button key="next" plain hotkey="j" label={isCompact ? 'j' : 'next'} onPress={() => moveSelection($, 1)} />
+        <Button key="older" plain hotkey="u" label={isCompact ? 'u' : 'older'} onPress={() => scrollEvents($, -5)} />
+        <Button key="newer" plain hotkey="d" label={isCompact ? 'd' : 'newer'} onPress={() => scrollEvents($, 5)} />
         <Button
           key="follow"
           plain
           hotkey="f"
-          label={view.anchorSeq === null ? 'follow: on' : 'follow: off'}
+          label={isCompact ? (view.anchorSeq === null ? 'f on' : 'f off') : view.anchorSeq === null ? 'follow: on' : 'follow: off'}
           onPress={() => toggleFollow($)}
         />
         <Button
           key="expand"
           plain
           hotkey="x"
-          label={view.isExpanded ? 'expand: on' : 'expand: off'}
+          label={isCompact ? (view.isExpanded ? 'x on' : 'x off') : view.isExpanded ? 'expand: on' : 'expand: off'}
           onPress={() => update($, VIEW, v => ({ ...v, isExpanded: !v.isExpanded }))}
         />
       </Box>
     )
-    used += width < 70 ? 2 : 1
 
     let detail: RenderElement | null = null
     if (selected === null) {
-      detail = <Text dimColor>{emptyText(status)}</Text>
+      detail = (
+        <Text dimColor wrap={truncate}>
+          {emptyText(status)}
+        </Text>
+      )
     } else if (selected.startsWith('claude:')) {
       const agent = claude.find(one => `claude:${one.id}` === selected)
-      detail = agent === undefined ? null : claudeDetail(Text, Box, agent)
+      detail = agent === undefined ? null : claudeDetail(Text, Box, agent, truncate)
     } else {
       const run = runs.find(one => one.id === selected)!
       const events = await readEvents($, run.id)
-      const summary = runDetail(Text, Box, run, now)
-      used += 4
+      const summary = isCompact ? runDetailLine(Text, run, now) : runDetail(Text, Box, run, now)
       detail = (
         <Box flexDirection="column">
           {summary}
-          {eventList(Text, Box, events, view, Math.max(3, rows - used), width, run.segmentsOmitted ?? 0)}
+          {eventList(Text, Box, events, view, budget, width, run.segmentsOmitted ?? 0)}
         </Box>
       )
     }
@@ -424,32 +632,53 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" width={width}>
         {header}
-        {notice !== null && <Text color="warning">{notice}</Text>}
-        {runRows.length > 0 && <Text dimColor>External workers</Text>}
+        {notice !== null && (
+          <Text color="warning" wrap={truncate}>
+            {notice}
+          </Text>
+        )}
+        {isCompact ? compactUsage(Text, Box, usage, refresh) : usageHeader}
+        {!isCompact && hasError && <Text color="error">usage.sh: {usage.error} (showing the last good figures)</Text>}
+        {!isCompact && usageRows(Text, Box, usage, now)}
+        {runRows.length > 0 && (
+          <Text dimColor wrap={truncate}>
+            External workers
+          </Text>
+        )}
         {runRows.map(run => (
-          <Button
-            key={`sel:${run.id}`}
-            plain
-            onPress={() => update($, VIEW, v => ({ ...v, selected: run.id, anchorSeq: null }))}
-          >
-            {run.id === selected ? '▸ ' : '  '}
-            {run.executor} <Text dimColor>{run.model ?? 'default model'}</Text> {run.label ?? run.id.slice(-8)}{' '}
-            <Text dimColor>{formatDuration(now - run.startedAt)}</Text> <Text color={stateColor(run)}>{stateLabel(run)}</Text>{' '}
-            <Text color={run.granularity === 'final-only' ? 'warning' : 'subtle'}>[{run.granularity}]</Text>
-            {run.warnings > 0 ? <Text color="warning"> ⚠{run.warnings}</Text> : ''}
-          </Button>
+          <Box key={`row:${run.id}`} flexDirection="row" columnGap={1}>
+            <Button
+              key={`sel:${run.id}`}
+              plain
+              label={`${run.id === selected ? '▸' : ' '} ${run.executor}`}
+              onPress={() => update($, VIEW, v => ({ ...v, selected: run.id, anchorSeq: null }))}
+            />
+            <Text wrap={truncate}>
+              <Text dimColor>{run.model ?? 'default model'}</Text> {run.label ?? run.id.slice(-8)}{' '}
+              <Text dimColor>{formatDuration(now - run.startedAt)}</Text> <Text color={stateColor(run)}>{stateLabel(run)}</Text>{' '}
+              <Text color={run.granularity === 'final-only' ? 'warning' : 'subtle'}>[{run.granularity}]</Text>
+              {run.warnings > 0 ? <Text color="warning"> ⚠{run.warnings}</Text> : ''}
+            </Text>
+          </Box>
         ))}
-        {claudeRows.length > 0 && <Text dimColor>Claude agents</Text>}
+        {claudeRows.length > 0 && (
+          <Text dimColor wrap={truncate}>
+            Claude agents
+          </Text>
+        )}
         {claudeRows.map(agent => (
-          <Button
-            key={`sel:claude:${agent.id}`}
-            plain
-            onPress={() => update($, VIEW, v => ({ ...v, selected: `claude:${agent.id}`, anchorSeq: null }))}
-          >
-            {`claude:${agent.id}` === selected ? '▸ ' : '  '}
-            {agent.type} <Text dimColor>{agent.model ?? 'model not reported'}</Text> {agent.description}{' '}
-            <Text dimColor>{agent.status ?? 'status not reported'}</Text>
-          </Button>
+          <Box key={`row:claude:${agent.id}`} flexDirection="row" columnGap={1}>
+            <Button
+              key={`sel:claude:${agent.id}`}
+              plain
+              label={`${`claude:${agent.id}` === selected ? '▸' : ' '} ${agent.type}`}
+              onPress={() => update($, VIEW, v => ({ ...v, selected: `claude:${agent.id}`, anchorSeq: null }))}
+            />
+            <Text wrap={truncate}>
+              <Text dimColor>{agent.model ?? 'model not reported'}</Text> {agent.description}{' '}
+              <Text dimColor>{agent.status ?? 'status not reported'}</Text>
+            </Text>
+          </Box>
         ))}
         <Text dimColor>{'─'.repeat(Math.min(width, 80))}</Text>
         {detail}
@@ -464,6 +693,126 @@ export const register: Register = on => {
 
 type TextC = ElementConstructor<TextProps>
 type BoxC = ElementConstructor<BoxProps>
+
+/** "1h 8m", "5d 12h": a coarse span for resets and ages. */
+function span(ms: number): string {
+  const m = Math.max(0, Math.round(ms / 60_000))
+  if (m < 1) return '<1m'
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  return h < 24 ? `${h}h ${m % 60}m` : `${Math.floor(h / 24)}d ${h % 24}h`
+}
+
+/** Same thresholds as the orchestrator's routing; `usedPct` and `remainingUsd` are optional. */
+function usageColor(usedPct: number | null, remainingUsd?: number): string {
+  if ((usedPct ?? 0) >= 95 || (remainingUsd ?? Infinity) < 1) return 'error'
+  if ((usedPct ?? 0) >= 80 || (remainingUsd ?? Infinity) < 5) return 'warning'
+  return 'success'
+}
+
+function usageRow(Text: TextC, Box: BoxC, name: string, key: string, body: RenderElement | null, note: string | null): RenderElement {
+  return (
+    <Box key={`usage:${key}`} flexDirection="row">
+      <Text dimColor>{name.padEnd(12)}</Text>
+      {body ?? <Text dimColor>{note}</Text>}
+    </Box>
+  )
+}
+
+/** Remaining, not used. `compact` (agy): "gemini 60% (week) · argon 100% (week) left", no resets. */
+function windowsBody(Text: TextC, windows: readonly UsageWindow[], now: number, compact: boolean): RenderElement | null {
+  if (windows.length === 0) return null
+  return (
+    <Text>
+      {windows.map((w, i) => (
+        <Text key={w.label}>
+          {i > 0 ? ' · ' : ''}
+          {w.label} <Text color={usageColor(w.usedPct)}>{Math.max(0, Math.round(100 - w.usedPct))}%</Text>
+          {compact ? (w.scope !== undefined ? ` (${w.scope})` : '') : ' left'}
+          {!compact && w.resetsAt !== null ? <Text dimColor> (resets {span(w.resetsAt - now)})</Text> : ''}
+        </Text>
+      ))}
+      {compact ? ' left' : ''}
+    </Text>
+  )
+}
+
+/** Tightest window of a provider: the one with the least left. */
+const tightest = (windows: readonly UsageWindow[]): UsageWindow | undefined => windows.reduce<UsageWindow | undefined>((a, w) => (a === undefined || w.usedPct > a.usedPct ? w : a), undefined)
+
+/** One line: "Usage · Claude 49% · Codex 69% · agy 0% (5h) · OR $16.31 · r" (remaining; ? when unknown). */
+function compactUsage(Text: TextC, Box: BoxC, usage: UsageState, refresh: RenderElement): RenderElement {
+  const s = usage.script
+  const T = ({ children, ...props }: { children: RenderElement | string; dimColor?: boolean; color?: string; bold?: boolean }) => (
+    <Text wrap="truncate-end" {...props}>
+      {children}
+    </Text>
+  )
+  const pct = (name: string, windows: readonly UsageWindow[], withScope = false): RenderElement => {
+    const w = tightest(windows)
+    if (w === undefined)
+      return (
+        <Text dimColor wrap="truncate-end">
+          {name} ?
+        </Text>
+      )
+    return (
+      <Text wrap="truncate-end">
+        {name}{' '}
+        <Text color={usageColor(w.usedPct)}>{Math.max(0, Math.round(100 - w.usedPct))}%</Text>
+        {withScope && w.scope !== undefined ? ` (${w.scope})` : ''}
+      </Text>
+    )
+  }
+  const credits = s?.openrouter.credits ?? null
+  return (
+    <Box key="usage:compact" flexDirection="row" flexWrap="nowrap" columnGap={1}>
+      <T bold>Usage</T>
+      <T dimColor>·</T>
+      {pct('Claude', usage.claude)}
+      <T dimColor>·</T>
+      {pct('Codex', s?.codex.windows ?? [])}
+      <T dimColor>·</T>
+      {pct('agy', s?.agy.windows ?? [], true)}
+      <T dimColor>·</T>
+      {credits === null ? (
+        <T dimColor>OR ?</T>
+      ) : (
+        <Text wrap="truncate-end">
+          OR <Text color={usageColor(null, credits.remainingUsd)}>${credits.remainingUsd.toFixed(2)}</Text>
+        </Text>
+      )}
+      {usage.error !== null && <T dimColor>· error</T>}
+      {refresh}
+    </Box>
+  )
+}
+
+function usageRows(Text: TextC, Box: BoxC, usage: UsageState, now: number): RenderElement {
+  const s: ScriptUsage | null = usage.script
+  const pending = usage.isRefreshing ? 'loading…' : 'not loaded yet'
+  const credits = s?.openrouter.credits ?? null
+  return (
+    <Box flexDirection="column">
+      {usageRow(Text, Box, 'Claude', 'claude', windowsBody(Text, usage.claude, now, false), 'no rate-limit windows reported (not on a subscription, or no API response yet)')}
+      {usageRow(Text, Box, 'Codex', 'codex', windowsBody(Text, s?.codex.windows ?? [], now, false), s === null ? pending : s.codex.note)}
+      {usageRow(Text, Box, 'Antigravity', 'agy', windowsBody(Text, s?.agy.windows ?? [], now, true), s === null ? pending : s.agy.note)}
+      {usageRow(
+        Text,
+        Box,
+        'OpenRouter',
+        'openrouter',
+        credits === null ? null : (
+          <Text>
+            <Text color={usageColor(null, credits.remainingUsd)}>${credits.remainingUsd.toFixed(2)}</Text> left
+            {credits.spentTodayUsd !== null ? ` · $${credits.spentTodayUsd.toFixed(2)} spent today` : ''}
+          </Text>
+        ),
+        s === null ? pending : s.openrouter.note,
+      )}
+    </Box>
+  )
+}
 
 function dirNotice(status: InspectorStatus): string | null {
   if (status.dir === 'unavailable') return `Log directory unavailable (${status.detail}); external runs are not shown.`
@@ -528,6 +877,17 @@ function runDetail(Text: TextC, Box: BoxC, run: RunSummary, now: number): Render
   )
 }
 
+/** The compact run summary: one truncated line instead of runDetail's four. */
+function runDetailLine(Text: TextC, run: RunSummary, now: number): RenderElement {
+  const last = run.lastEventAt
+  return (
+    <Text wrap="truncate-end">
+      <Text color={stateColor(run)}>{stateLabel(run)}</Text> · <Text color={run.granularity === 'final-only' ? 'warning' : 'subtle'}>{run.granularity}</Text> · last event{' '}
+      {last === null ? 'none' : `${formatDuration(now - last)} ago`} · reported {run.reported ?? '—'}
+    </Text>
+  )
+}
+
 const KIND_COLOR: Record<string, string> = {
   message: 'text',
   'reasoning summary': 'remember',
@@ -539,59 +899,110 @@ const KIND_COLOR: Record<string, string> = {
   other: 'inactive',
 }
 
+/**
+ * Hard-wraps `text` into lines of at most `width` characters (newlines
+ * respected, an empty line is one empty chunk) and keeps the first `maxRows`.
+ * When anything is left out the last line ends with CUT_MARKER, still within
+ * `width`.
+ */
+export function fitLines(text: string, width: number, maxRows: number): { lines: string[]; isCut: boolean } {
+  const w = Math.max(1, width)
+  const lines: string[] = []
+  let isCut = false
+  outer: for (const line of text.split('\n')) {
+    const chunks = Math.max(1, Math.ceil(line.length / w))
+    for (let i = 0; i < chunks; i++) {
+      if (lines.length >= maxRows) {
+        isCut = true
+        break outer
+      }
+      lines.push(line.slice(i * w, (i + 1) * w))
+    }
+  }
+  if (isCut && lines.length > 0) {
+    const last = lines.length - 1
+    lines[last] = `${lines[last]!.slice(0, Math.max(0, w - CUT_MARKER.length)).trimEnd()}${CUT_MARKER}`.slice(0, w)
+  }
+  return { lines, isCut }
+}
+
 function eventList(
   Text: TextC,
   Box: BoxC,
   events: RunEvents,
   view: InspectorView,
-  room: number,
+  budget: PaneBudget,
   width: number,
   segmentsOmitted: number,
 ): RenderElement {
+  const isCompact = budget.isCompact
+  const wrap = isCompact ? ('truncate-end' as const) : undefined
   const items = events.items
   const lost =
     segmentsOmitted > 0
       ? `events of ${segmentsOmitted} log segment${segmentsOmitted === 1 ? '' : 's'} omitted (rotated away or over the read limit; not counted)`
       : ''
-  if (items.length === 0) return <Text dimColor>{lost || 'No events yet.'}</Text>
+  if (items.length === 0) return <Text dimColor wrap={wrap}>{lost || 'No events yet.'}</Text>
   const end =
     view.anchorSeq === null
       ? items.length
       : Math.max(1, items.findIndex(one => one.seq > view.anchorSeq!) === -1 ? items.length : items.findIndex(one => one.seq > view.anchorSeq!))
+  const below = items.length - end
   const limit = view.isExpanded ? MAX_STORED_CHARS : SHOWN_CHARS
-  // Fill the room from the anchor backwards, estimating wrapped lines.
-  const shown: DisplayEvent[] = []
-  let left = room - 1
+  // One row for the "older" notices (when there may be any) and one for the
+  // "below" line come off the room before the events are fitted.
+  const hasOlderRow = end > 1 || events.omitted > 0 || segmentsOmitted > 0
+  let left = budget.eventRoom - (hasOlderRow ? 1 : 0) - (below > 0 ? 1 : 0)
+  // The first (newest) event must fit too: if it does not, its text is cut so the
+  // header and the text fit in the rows left. One that does not fit even then is
+  // dropped (the "more above" note says so). Compact events are drawn as the
+  // pre-wrapped lines counted here, so rendered rows equal counted rows.
+  const fitted: DisplayEvent[] = []
+  const shownLines = new Map<number, string[]>()
   for (let i = end - 1; i >= 0; i--) {
     const one = items[i]!
-    const cost = 1 + lineCount(shownText(one, limit), width)
-    if (shown.length > 0 && cost > left) break
-    shown.unshift(one)
+    const text = shownText(one, limit)
+    const all = fitLines(text, width, Infinity).lines
+    const cost = 1 + all.length
+    if (cost > left) {
+      if (fitted.length === 0 && left >= 2) {
+        fitted.unshift(one)
+        shownLines.set(one.seq, fitLines(text, width, left - 1).lines)
+      }
+      break
+    }
+    fitted.unshift(one)
+    if (isCompact) shownLines.set(one.seq, all)
     left -= cost
   }
-  const above = end - shown.length
-  const below = items.length - end
+  const above = end - fitted.length
   const older = [
-    lost,
-    events.omitted > 0 ? `${events.omitted} older event${events.omitted === 1 ? '' : 's'} omitted (only the newest ${items.length} are kept)` : '',
     above > 0 ? `${above} more above (u to scroll)` : '',
+    events.omitted > 0 ? `${events.omitted} older event${events.omitted === 1 ? '' : 's'} omitted (only the newest ${items.length} are kept)` : '',
+    lost,
   ].filter(Boolean)
   return (
     <Box flexDirection="column">
-      {older.length > 0 && <Text dimColor>{older.join(' · ')}</Text>}
-      {shown.map(one => (
+      {older.length > 0 && <Text key="ev:older" dimColor wrap={wrap}>{older.join(' · ')}</Text>}
+      {fitted.map(one => (
         <Box key={`ev:${one.seq}`} flexDirection="column">
-          <Text>
+          <Text wrap="truncate-end">
             <Text dimColor>{clockTime(one.at)} </Text>
             <Text bold color={one.isError ? 'error' : KIND_COLOR[one.kind]}>
               {one.kind}
             </Text>
             {one.role !== undefined ? <Text dimColor> ({one.role})</Text> : ''}
           </Text>
-          <Text>{shownText(one, limit)}</Text>
+          {isCompact ? (
+            shownLines.get(one.seq)!.map((text, n) => (
+              <Text key={`evline:${one.seq}:${n}`} wrap="truncate-end">{text}</Text>
+            ))
+          ) : (
+            <Text>{shownLines.get(one.seq)?.join('\n') ?? shownText(one, limit)}</Text>
+          )}
         </Box>
       ))}
-      {below > 0 && <Text dimColor>{below} newer event{below === 1 ? '' : 's'} below (f to follow)</Text>}
+      {below > 0 && <Text key="ev:below" dimColor wrap={wrap}>{below} newer event{below === 1 ? '' : 's'} below (f to follow)</Text>}
     </Box>
   )
 }
@@ -601,22 +1012,19 @@ function shownText(one: DisplayEvent, limit: number): string {
   return `${one.text.slice(0, limit)}… [${one.text.length - limit} more; x to expand]`
 }
 
-function lineCount(text: string, width: number): number {
-  return text.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(line.length / width)), 0)
-}
-
-function claudeDetail(Text: TextC, Box: BoxC, agent: ClaudeAgent): RenderElement {
+/** Four one-line fields (truncated when the pane is compact), so four rows at most. */
+function claudeDetail(Text: TextC, Box: BoxC, agent: ClaudeAgent, wrap?: 'truncate-end'): RenderElement {
   return (
     <Box flexDirection="column">
-      <Text>
+      <Text wrap={wrap}>
         <Text bold>Claude agent</Text> {agent.type} · {agent.model ?? 'model not reported'} · {agent.status ?? 'status not reported'}
       </Text>
-      <Text>{agent.description || '(no description)'}</Text>
-      <Text dimColor>
+      <Text wrap={wrap}>{agent.description || '(no description)'}</Text>
+      <Text dimColor wrap={wrap}>
         id {agent.id} · parent {agent.parentId ?? 'main conversation'}
         {agent.spawnedAt !== null ? ` · seen ${clockTime(agent.spawnedAt)}` : ''}
       </Text>
-      <Text dimColor>Only what agent.spawn and the agent list expose; open its transcript from the tasks list.</Text>
+      <Text dimColor wrap={wrap}>Only what agent.spawn and the agent list expose; open its transcript from the tasks list.</Text>
     </Box>
   )
 }
