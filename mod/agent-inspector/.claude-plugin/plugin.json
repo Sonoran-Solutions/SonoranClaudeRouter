@@ -1,0 +1,6 @@
+{
+  "name": "agent-inspector",
+  "version": "0.1.0",
+  "description": "Read-only pane showing orchestrator worker runs (Codex, Pi, agy) from their run logs, plus Claude-native agents.",
+  "types": "./types/index.d.ts"
+}
