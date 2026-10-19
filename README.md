@@ -1,6 +1,6 @@
 # SonoranClaudeRouter
 
-**Status: Agent Inspector design proposal. No implementation is included.** This repository documents a read-only inspector for the existing Claude Code orchestration skill at `~/.claude/skills/orchestrator`. That skill is not copied into this repository and its execution or routing logic has not been changed.
+**Status: MVP implementation under review.** This repository holds a read-only Agent Inspector for the existing Claude Code orchestration skill at `~/.claude/skills/orchestrator`: a native Claude Code mod ([`mod/agent-inspector/`](mod/agent-inspector/)) and instrumented copies of the three external-worker wrappers ([`orchestrator/`](orchestrator/)). Routing, quota policy and the rest of the skill are not copied or changed, and the live wrappers are only replaced when the owner installs the new ones. Evidence and open gates: [docs/EVIDENCE.md](docs/EVIDENCE.md).
 
 ## Why build it?
 
@@ -33,11 +33,21 @@ The owner's installed Claude Code build (2.1.299) provides a native mod pane via
 
 There is **no collector service, socket, browser viewer, persistent ingestion cursor, Pi RPC conversion, or direct OpenRouter streaming adapter** in the proposed MVP. Worker processes remain owned by their existing wrappers. The mod observes them without steering, approving tools, or changing routing.
 
+## Layout
+
+| Path | What |
+| --- | --- |
+| [`mod/agent-inspector/`](mod/agent-inspector/) | the read-only pane (`/agent-inspector`), its tests and install notes |
+| [`orchestrator/`](orchestrator/) | instrumented `run_codex.sh`, `run_pi.sh`, `run_agy.sh` + `_runlog.sh`, install notes |
+| [`tests/`](tests/) | wrapper test suite (fake workers) and sanitized provider fixtures |
+| [`docs/LOG_CONTRACT.md`](docs/LOG_CONTRACT.md) | the run-log format both sides implement |
+
 ## Documentation
 
 - [Small implementation plan](docs/IMPLEMENTATION_PLAN.md): native pane, external runners first, Claude attribution second, then tests.
 - [Design and safety boundaries](docs/AGENT_INSPECTOR_DESIGN.md): UI, log contract, honesty, privacy, and non-interference.
 - [Local integration evidence](docs/INTEGRATION_RESEARCH.md): installed APIs, current wrappers, quota source, and remaining checks.
 - [Mockup asset notes](docs/assets/README.md): committed image and interpretation.
+- [Run-log contract](docs/LOG_CONTRACT.md) and [evidence](docs/EVIDENCE.md).
 
-**Next task proposed, not authorized by these documents:** implement the native pane from `pane.tsx` and demonstrate that it opens in the desktop app. Keep the current routing policy intact.
+**Remaining before merge:** a person confirms the pane updates and closes in the desktop app and shows concurrent workers separately, and the owner decides whether to install the new wrappers. See [evidence](docs/EVIDENCE.md).
