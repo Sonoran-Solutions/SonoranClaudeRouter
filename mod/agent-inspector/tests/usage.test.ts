@@ -294,7 +294,8 @@ test('paneBudget never budgets more rows than the body has', () => {
 /**
  * How many rows a tree estimates to: a Text is one line (wrapping at `width`),
  * a Button one line, and a Box stacks its children unless it lays them in a row
- * (then its texts and buttons share one line, the tallest winning).
+ * (then its children share the line, the tallest winning: a nested Box is a column
+ * of that row). A Box that names no direction stacks, which over-counts, never under.
  */
 function drawnRows(tree: unknown, width: number): number {
   if (typeof tree === 'string') return 1
@@ -310,11 +311,11 @@ function drawnRows(tree: unknown, width: number): number {
     return Math.max(1, Math.ceil(longest / width))
   }
   if (el.props?.flexDirection === 'row') {
-    // Strings and inline Texts share the line; a nested Box starts its own.
+    // Strings, inline Texts and nested Boxes sit side by side; the tallest sets the height.
     let rows = 1
     for (const child of children) {
       if (typeof child !== 'object' || child === null) continue
-      if ((child as { type?: string }).type === 'Box') rows += drawnRows(child, width)
+      if ((child as { type?: string }).type === 'Box') rows = Math.max(rows, drawnRows(child, width))
     }
     return rows
   }

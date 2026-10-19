@@ -593,28 +593,32 @@ export const register: Register = on => {
     const chipText = <Text color={running > 0 ? 'success' : 'inactive'}>{chip}</Text>
     const header = isRoomy ? (
       <Box key="head" flexDirection="column">
-        <Box flexDirection="row" justifyContent="space-between">
+        {splitRow(
+          Box,
+          'title',
           <Text bold wrap={truncate}>
             {TITLE}
-          </Text>
-          <Text wrap={truncate}>{chipText}</Text>
-        </Box>
+          </Text>,
+          <Text wrap={truncate}>{chipText}</Text>,
+        )}
         <Text dimColor wrap={truncate}>
           Read-only view of delegated workers · {counts}
           {polled}
         </Text>
       </Box>
     ) : (
-      <Box key="head" flexDirection="row" justifyContent="space-between">
+      splitRow(
+        Box,
+        'head',
         <Text wrap={truncate}>
           <Text bold>{TITLE}</Text>
-          <Text dimColor>{fit(` · read-only · ${counts}`, width - TITLE.length - chip.length - polled.length - 1)}</Text>
-        </Text>
+          <Text dimColor> · read-only · {counts}</Text>
+        </Text>,
         <Text wrap={truncate}>
           {chipText}
           <Text dimColor>{polled}</Text>
-        </Text>
-      </Box>
+        </Text>,
+      )
     )
 
     const refresh = (
@@ -673,7 +677,7 @@ export const register: Register = on => {
     } else if (selected.startsWith('claude:')) {
       const agent = claude.find(one => `claude:${one.id}` === selected)
       // Compact: one budgeted line; the rest only fills the event room it leaves unused.
-      const lines = agent === undefined ? [] : claudeDetail(Text, Box, agent, inner).slice(0, isCompact ? 1 + budget.eventRoom : CLAUDE_DETAIL_ROWS)
+      const lines = agent === undefined ? [] : claudeDetail(Text, Box, agent).slice(0, isCompact ? 1 + budget.eventRoom : CLAUDE_DETAIL_ROWS)
       detail = (
         <Box key="detail" flexDirection="column" {...cardProps('claude')}>
           {lines}
@@ -684,7 +688,7 @@ export const register: Register = on => {
       const events = await readEvents($, run.id)
       const summary = isCompact
         ? [runDetailLine(Text, run, now), originLine(Text, run, me)]
-        : runDetail(Text, Box, run, events, view, now, me, inner)
+        : runDetail(Text, Box, run, events, view, now, me)
       detail = (
         <Box key="detail" flexDirection="column" {...cardProps('claude')}>
           {summary}
@@ -705,64 +709,85 @@ export const register: Register = on => {
         {runRows.length > 0 && sectionTitle(Text, 'External workers', runs.length)}
         {runRows.map(run => {
           const isSelected = run.id === selected
-          const time = `  ${runtime(run, now)}  `
-          const state = stateLabel(run)
-          const gran = ` [${run.granularity}]`
-          const warn = run.warnings > 0 ? ` ⚠${run.warnings}` : ''
           const chat = width >= 100 && run.sessionTitle ? ` · ${run.sessionTitle}` : ''
-          const room = width - 4 - run.executor.length - (time + state + gran + warn).length
-          const [model, label, from] = fitParts([` · ${run.model ?? 'default model'}`, `  ${run.label ?? run.id.slice(-8)}`, chat], room)
           return (
-            <Box key={`row:${run.id}`} flexDirection="row">
-              <Text color="claude" bold>
-                {isSelected ? '▸ ' : '  '}
-              </Text>
-              <Text color={stateColor(run)}>● </Text>
-              <Button
-                key={`sel:${run.id}`}
-                plain
-                label={run.executor}
-                onPress={() => update($, VIEW, v => ({ ...v, selected: run.id, anchorSeq: null }))}
-              />
-              <Text wrap={truncate}>
-                <Text bold>{model}</Text>
-                {label}
-                <Text dimColor>{from}</Text>
-              </Text>
-              <Text wrap={truncate}>
-                <Text dimColor>{time}</Text>
-                <Text color={stateColor(run)}>{state}</Text>
-                <Text color={run.granularity === 'final-only' ? 'warning' : 'subtle'}>{gran}</Text>
-                {warn === '' ? '' : <Text color="warning">{warn}</Text>}
-              </Text>
+            <Box key={`row:${run.id}`} flexDirection="row" columnGap={1}>
+              {/* Left: marker, dot and the pressable executor stay whole; the rest truncates. */}
+              <Box flexDirection="row" flexGrow={1} flexShrink={1}>
+                <Box flexDirection="row" flexShrink={0}>
+                  <Text color="claude" bold>
+                    {isSelected ? '▸ ' : '  '}
+                  </Text>
+                  <Text color={stateColor(run)}>● </Text>
+                  <Button
+                    key={`sel:${run.id}`}
+                    plain
+                    label={run.executor}
+                    onPress={() => update($, VIEW, v => ({ ...v, selected: run.id, anchorSeq: null }))}
+                  />
+                </Box>
+                <Box flexDirection="row" flexGrow={1} flexShrink={1}>
+                  <Text wrap={truncate}>
+                    <Text bold> · {shortModel(run.model) ?? 'default model'}</Text>
+                    {'  '}
+                    {run.label ?? run.id.slice(-8)}
+                    <Text dimColor>{chat}</Text>
+                  </Text>
+                </Box>
+              </Box>
+              {/* Right: fixed-width columns, so they line up on a proportional font too. */}
+              <Box flexDirection="row" flexShrink={0} columnGap={2}>
+                <Box flexDirection="row" width={7} justifyContent="flex-end">
+                  <Text dimColor wrap={truncate}>
+                    {runtime(run, now)}
+                  </Text>
+                </Box>
+                <Box flexDirection="row" width={13}>
+                  <Text wrap={truncate}>
+                    <Text color={stateColor(run)}>{stateLabel(run)}</Text>
+                    {run.warnings > 0 ? <Text color="warning"> ⚠{run.warnings}</Text> : ''}
+                  </Text>
+                </Box>
+                <Box flexDirection="row" width={12}>
+                  <Text color={run.granularity === 'final-only' ? 'warning' : 'subtle'} wrap={truncate}>
+                    [{run.granularity}]
+                  </Text>
+                </Box>
+              </Box>
             </Box>
           )
         })}
         {claudeRows.length > 0 && sectionTitle(Text, 'Claude agents', claude.length)}
         {claudeRows.map(agent => {
           const isSelected = `claude:${agent.id}` === selected
-          const state = `  ${agent.status ?? 'status not reported'}`
-          const room = width - 4 - agent.type.length - state.length
-          const [model, description] = fitParts([` · ${agent.model ?? 'model not reported'}`, `  ${agent.description}`], room)
           return (
-            <Box key={`row:claude:${agent.id}`} flexDirection="row">
-              <Text color="claude" bold>
-                {isSelected ? '▸ ' : '  '}
-              </Text>
-              <Text color={agentColor(agent)}>● </Text>
-              <Button
-                key={`sel:claude:${agent.id}`}
-                plain
-                label={agent.type}
-                onPress={() => update($, VIEW, v => ({ ...v, selected: `claude:${agent.id}`, anchorSeq: null }))}
-              />
-              <Text wrap={truncate}>
-                <Text bold>{model}</Text>
-                {description}
-              </Text>
-              <Text color={agentColor(agent)} wrap={truncate}>
-                {state}
-              </Text>
+            <Box key={`row:claude:${agent.id}`} flexDirection="row" columnGap={1}>
+              <Box flexDirection="row" flexGrow={1} flexShrink={1}>
+                <Box flexDirection="row" flexShrink={0}>
+                  <Text color="claude" bold>
+                    {isSelected ? '▸ ' : '  '}
+                  </Text>
+                  <Text color={agentColor(agent)}>● </Text>
+                  <Button
+                    key={`sel:claude:${agent.id}`}
+                    plain
+                    label={agent.type}
+                    onPress={() => update($, VIEW, v => ({ ...v, selected: `claude:${agent.id}`, anchorSeq: null }))}
+                  />
+                </Box>
+                <Box flexDirection="row" flexGrow={1} flexShrink={1}>
+                  <Text wrap={truncate}>
+                    <Text bold> · {shortModel(agent.model) ?? 'model not reported'}</Text>
+                    {'  '}
+                    {agent.description}
+                  </Text>
+                </Box>
+              </Box>
+              <Box flexDirection="row" flexShrink={0}>
+                <Text color={agentColor(agent)} wrap={truncate}>
+                  {agent.status ?? 'status not reported'}
+                </Text>
+              </Box>
             </Box>
           )
         })}
@@ -780,22 +805,26 @@ export const register: Register = on => {
 type TextC = ElementConstructor<TextProps>
 type BoxC = ElementConstructor<BoxProps>
 
-/** Cuts `text` to `columns` characters, an ellipsis marking the cut. */
-function fit(text: string, columns: number): string {
-  if (columns <= 0) return ''
-  return text.length <= columns ? text : `${text.slice(0, columns - 1)}…`
+/**
+ * One line, `left` filling what `right` leaves and truncated by the layout,
+ * `right` never shrunk: aligned on the terminal and on a proportional font.
+ */
+function splitRow(Box: BoxC, key: string, left: RenderElement, right: RenderElement): RenderElement {
+  return (
+    <Box key={key} flexDirection="row" columnGap={1}>
+      <Box flexDirection="row" flexGrow={1} flexShrink={1}>
+        {left}
+      </Box>
+      <Box flexDirection="row" flexShrink={0}>
+        {right}
+      </Box>
+    </Box>
+  )
 }
 
-/** Fits `parts` in order into `columns` (later parts give way first) and pads the last to fill them. */
-function fitParts(parts: readonly string[], columns: number): string[] {
-  let left = Math.max(0, columns)
-  const out = parts.map(part => {
-    const one = fit(part, left)
-    left -= one.length
-    return one
-  })
-  out[out.length - 1] += ' '.repeat(left)
-  return out
+/** A model id without its vendor prefix (`deepseek/deepseek-v4.1-flash` -> `deepseek-v4.1-flash`), for rows. */
+function shortModel(model: string | null): string | null {
+  return model === null ? null : model.slice(model.lastIndexOf('/') + 1) || model
 }
 
 function sectionTitle(Text: TextC, title: string, count: number): RenderElement {
@@ -833,7 +862,7 @@ const METER_CELLS = 10
 
 /** A remaining-share bar (`████░░░░░░ `); blank cells when nothing is known. */
 function meter(Text: TextC, usedPct: number | null, remainingUsd?: number): RenderElement {
-  if (usedPct === null) return <Text>{' '.repeat(METER_CELLS + 1)}</Text>
+  if (usedPct === null) return <Text> </Text>
   const filled = Math.max(0, Math.min(METER_CELLS, Math.round(((100 - usedPct) / 100) * METER_CELLS)))
   return (
     <Text>
@@ -843,14 +872,31 @@ function meter(Text: TextC, usedPct: number | null, remainingUsd?: number): Rend
   )
 }
 
+/** Fixed-width name and bar columns, so bars and figures line up on a proportional font too. */
 function usageRow(Text: TextC, Box: BoxC, name: string, key: string, bar: RenderElement | null, body: RenderElement | null, note: string | null): RenderElement {
   return (
     <Box key={`usage:${key}`} flexDirection="row">
-      <Text wrap="truncate-end">
-        <Text dimColor>{name.padEnd(12)}</Text>
-        {bar ?? ''}
-        {body ?? <Text dimColor>{note}</Text>}
-      </Text>
+      <Box flexDirection="row" width={12} flexShrink={0}>
+        <Text dimColor wrap="truncate-end">
+          {name}
+        </Text>
+      </Box>
+      {bar === null ? (
+        ''
+      ) : (
+        <Box flexDirection="row" width={METER_CELLS + 1} flexShrink={0}>
+          {bar}
+        </Box>
+      )}
+      <Box flexDirection="row" flexGrow={1} flexShrink={1}>
+        {body === null ? (
+          <Text dimColor wrap="truncate-end">
+            {note}
+          </Text>
+        ) : (
+          <Text wrap="truncate-end">{body}</Text>
+        )}
+      </Box>
     </Box>
   )
 }
@@ -1028,7 +1074,6 @@ function runDetail(
   view: InspectorView,
   now: number,
   me: string | null,
-  width: number,
 ): RenderElement[] {
   const wrap = 'truncate-end' as const
   const last = run.lastEventAt
@@ -1048,8 +1093,8 @@ function runDetail(
   const isFinalOnly = run.granularity === 'final-only'
 
   // Title: executor · model, label on the left; state, granularity, follow chips on the right.
-  const chips = [`● ${state}`, run.granularity, view.anchorSeq === null ? '● following' : '○ follow off']
-  const [name, label] = fitParts([`${run.executor} · ${run.model ?? 'executor default model'}`, `  ${run.label ?? 'no label'}`], width - chips.join('  ').length - 1)
+  // The full model id here; rows drop the vendor prefix.
+  const isFollowing = view.anchorSeq === null
 
   // Stats from what the mod has: events seen, tool calls among the kept events, wall time, freshness.
   const isPartial = events.omitted > 0 || run.segmentsOmitted > 0
@@ -1064,19 +1109,24 @@ function runDetail(
     </Text>
   )
   return [
-    <Box key="title" flexDirection="row" justifyContent="space-between">
+    splitRow(
+      Box,
+      'title',
       <Text wrap={wrap}>
-        <Text bold>{name}</Text>
-        {label}
-      </Text>
+        <Text bold>
+          {run.executor} · {run.model ?? 'executor default model'}
+        </Text>
+        {'  '}
+        {run.label ?? 'no label'}
+      </Text>,
       <Text wrap={wrap}>
-        <Text color={stateColor(run)}>{chips[0]}</Text>
+        <Text color={stateColor(run)}>● {state}</Text>
         {'  '}
-        <Text color={isFinalOnly ? 'warning' : 'subtle'}>{chips[1]}</Text>
+        <Text color={isFinalOnly ? 'warning' : 'subtle'}>{run.granularity}</Text>
         {'  '}
-        <Text color={view.anchorSeq === null ? 'success' : 'warning'}>{chips[2]}</Text>
-      </Text>
-    </Box>,
+        <Text color={isFollowing ? 'success' : 'warning'}>{isFollowing ? '● following' : '○ follow off'}</Text>
+      </Text>,
+    ),
     <Text key="stats" wrap={wrap}>
       {stat('Events', `${events.items.length + events.omitted}${run.segmentsOmitted > 0 ? '+' : ''}`)}
       {isFinalOnly ? '' : stat('Tool calls', `${isPartial ? '≥' : ''}${toolCalls}`)}
@@ -1260,19 +1310,19 @@ function shownText(one: DisplayEvent, limit: number): string {
 }
 
 /** CLAUDE_DETAIL_ROWS one-line fields; the caller keeps as many as it has room for. */
-function claudeDetail(Text: TextC, Box: BoxC, agent: ClaudeAgent, width: number): RenderElement[] {
+function claudeDetail(Text: TextC, Box: BoxC, agent: ClaudeAgent): RenderElement[] {
   const wrap = 'truncate-end' as const
-  const state = `● ${agent.status ?? 'status not reported'}`
-  const [name] = fitParts([`Claude agent · ${agent.type} · ${agent.model ?? 'model not reported'}`], width - state.length - 1)
   return [
-    <Box key="title" flexDirection="row" justifyContent="space-between">
+    splitRow(
+      Box,
+      'title',
       <Text bold wrap={wrap}>
-        {name}
-      </Text>
+        Claude agent · {agent.type} · {agent.model ?? 'model not reported'}
+      </Text>,
       <Text color={agentColor(agent)} wrap={wrap}>
-        {state}
-      </Text>
-    </Box>,
+        ● {agent.status ?? 'status not reported'}
+      </Text>,
+    ),
     <Text key="description" wrap={wrap}>
       {agent.description || '(no description)'}
     </Text>,

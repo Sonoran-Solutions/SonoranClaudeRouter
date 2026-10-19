@@ -132,7 +132,7 @@ test('the detail names the chat and project that launched a run, or says they we
   const clock = mock.clock(on, { now: NOW })
   on('session.id', () => ({ value: 'session-mine' }))
   const withOrigin = line({
-    v: 1, type: 'orchestrator.start', run_id: CODEX, executor: 'codex', model: 'gpt-5.5', label: 'codex-task',
+    v: 1, type: 'orchestrator.start', run_id: CODEX, executor: 'codex', model: 'openai/gpt-5.5', label: 'codex-task',
     parent: null, workdir: '/tmp/w', pid: 4242, session_id: 'session-mine', session_title: 'Fix the router',
     project: '/home/dq/SonoranClaudeRouter', granularity: 'live', ts: '2026-10-19T17:19:00.000Z',
   })
@@ -148,13 +148,18 @@ test('the detail names the chat and project that launched a run, or says they we
   const runs = new Map((w.state.get('runs') as RunSummary[]).map(run => [run.id, run]))
   expect(runs.get(CODEX)).toMatchObject({ sessionId: 'session-mine', sessionTitle: 'Fix the router', project: '/home/dq/SonoranClaudeRouter' })
   expect(runs.get(AGY)).toMatchObject({ sessionId: null, sessionTitle: null, project: null })
-  expect((w.state.get(`events:${CODEX}`) as RunEvents).items[0]?.text).toBe('started codex · model gpt-5.5 · label codex-task · from chat Fix the router')
+  expect((w.state.get(`events:${CODEX}`) as RunEvents).items[0]?.text).toBe('started codex · model openai/gpt-5.5 · label codex-task · from chat Fix the router')
 
   for (const surface of SURFACES) {
     for (const bodyRows of [40, 12]) {
       const ui = await $.ui.mount({ plugin: 'agent-inspector', surface, component: 'Pane', requestId: 'agent-inspector', props: { ...PANE, scroll: { offset: 0, bodyRows } } })
       expect(await ui.find({ type: 'Text', text: /^chat not recorded · project not recorded$/ })).toBeDefined()
+      // Rows drop the vendor prefix of a model id; the detail keeps it.
+      const row = (await ui.find({ type: 'Box', key: `row:${CODEX}` }))?.text ?? ''
+      expect(row).toMatch(/codex · gpt-5\.5.*exited 0.*\[live\]/)
+      expect(row).not.toMatch(/openai/)
       await ui.press({ key: 'next' })
+      if (bodyRows === 40) expect(await ui.find({ type: 'Text', text: /^codex · openai\/gpt-5\.5$/ })).toBeDefined()
       expect(await ui.find({ type: 'Text', text: /^Chat Fix the router \(this chat\) · Project SonoranClaudeRouter \(\/home\/dq\/SonoranClaudeRouter\)$/ })).toBeDefined()
       expect(await ui.find({ text: /chat not recorded/ })).toBeUndefined()
       await ui.press({ key: 'prev' })
